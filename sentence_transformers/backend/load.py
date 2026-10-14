@@ -24,9 +24,9 @@ def load_onnx_model(model_name_or_path: str, config: PretrainedConfig, task_name
         model_kwargs (dict): Additional keyword arguments for the model loading.
     """
     logger.warning(
-        "This ONNX model only exports part of the model (the transformer), rather than the whole model. "
+        "This model was exported with a previous version of sentence-transformers and only a part of the model was exported (Transformers)."
         "Loading such models is deprecated and will be removed in a future release. "
-        "Please consider re-exporting your model to export the full model."
+        "Please consider re-exporting your model to export the full model instead."
     )
     try:
         import onnxruntime as ort
@@ -101,9 +101,9 @@ def load_openvino_model(model_name_or_path: str, config: PretrainedConfig, task_
         model_kwargs (dict): Additional keyword arguments for the model loading.
     """
     logger.warning(
-        "This OpenVINO model only exports part of the model (the transformer), rather than the whole model. "
+        "This model was exported with a previous version of sentence-transformers and only a part of the model was exported (Transformers)."
         "Loading such models is deprecated and will be removed in a future release. "
-        "Please consider re-exporting your model to export the full model."
+        "Please consider re-exporting your model to export the full model instead."
     )
     try:
         from optimum.intel.openvino import (
