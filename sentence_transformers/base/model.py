@@ -38,6 +38,18 @@ from transformers.dynamic_module_utils import get_relative_import_files
 from transformers.utils import logging as transformers_logging
 
 from sentence_transformers import __version__
+from sentence_transformers.backend.export import (
+    BACKEND_NAMES,
+    BackendPlan,
+    export_model,
+    export_graph_name,
+    new_export_directory,
+    read_export_config,
+    resolve_backend_plan,
+    resolve_export_directory,
+    save_export,
+)
+from sentence_transformers.backend.utils import backend_warn_to_save
 from sentence_transformers.base.evaluation import BaseEvaluator
 from sentence_transformers.base.modality import infer_batch_modality, is_message_dict, raise_unsupported_modality_error
 from sentence_transformers.base.modality_types import Modality, PairInput, SingleInput
@@ -199,6 +211,13 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         self._model_card_vars = {}
         self._model_card_text = None
         self.backend = backend
+        self._exported_model = None
+        self._export_directory = None
+        self._export_temporary_directory = None
+        # used to keep compatibility with legacy models
+        self._module_backend = backend
+        backend_plan = BackendPlan.torch()
+        backend_kwargs = {}
 
         if cache_folder is None:
             cache_folder = os.getenv("SENTENCE_TRANSFORMERS_HOME")
@@ -251,6 +270,15 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
                 "Both `model_name_or_path` and `modules` were provided. The modules are loaded from "
                 "`model_name_or_path`, so the `modules` argument is ignored."
             )
+        if model_name_or_path and backend != "torch":
+            backend_plan = resolve_backend_plan(
+                model_name_or_path, backend, model_kwargs, token=token, revision=revision
+            )
+            if backend_plan.message:
+                logger.warning(backend_plan.message)
+            if backend_plan.is_full:
+                self._module_backend = "torch"
+                backend_kwargs, model_kwargs = backend_plan.split_model_kwargs(backend, model_kwargs)
         if model_name_or_path:
             modules, self.module_kwargs = self._load_modules(
                 model_name_or_path,
@@ -277,7 +305,9 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
 
         self._device_map = device_map
         self._modules_placed = False
-        if self._placement_is_delegated:
+        if backend_plan.is_full:
+            self._load_exported_model(model_name_or_path, backend_plan, backend_kwargs, token, revision, cache_folder)
+        elif self._placement_is_delegated:
             self._place_modules()
         else:
             first_param = next(self[0].parameters(), None)
@@ -564,7 +594,10 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         return 1
 
     def forward(self, input: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
-        """Forward pass through all modules in the model."""
+        """Forward pass through all modules in the model, or through the exported graph for the
+        ``"onnx"`` and ``"openvino"`` backends."""
+        if self._exported_model is not None:
+            return self._forward_exported(input)
         for module_name, module in self.named_children():
             module_kwargs = {}
             if isinstance(module, Router):
@@ -580,6 +613,70 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
                 }
             input = module(input, **module_kwargs)
         return input
+
+    def _export_sample_inputs(self) -> list[Any]:
+        """Example inputs to trace the model with onnx or openvino"""
+        return ["This is a sample sentence.", "Another sample sentence, which is a little bit longer than the first."]
+
+    def _load_exported_model(
+        self,
+        model_name_or_path: str,
+        plan: BackendPlan,
+        backend_kwargs: dict[str, Any],
+        token: bool | str | None,
+        revision: Any,
+        cache_folder: str | None,
+    ) -> None:
+        """Load the export of the whole model, which is exported first (from the modules of this model) if needed."""
+        from transformers.exporters import AutoExportedModel
+
+        backend = self.backend
+        if plan.export:
+            # The temporary directory is kept until this model is collected
+            self._export_temporary_directory = new_export_directory()
+            self._export_directory = export_model(self, backend, self._export_temporary_directory.name)
+            self._exported_model = AutoExportedModel.from_pretrained(self._export_directory)
+            backend_warn_to_save(model_name_or_path, os.path.isdir(model_name_or_path), BACKEND_NAMES[backend])
+            return
+
+        self._export_directory = resolve_export_directory(
+            model_name_or_path, plan.subfolder, token=token, revision=revision, cache_dir=cache_folder
+        )
+        export_format = read_export_config(self._export_directory)["export_format"]
+        if export_format != backend:
+            raise ValueError(
+                f"{model_name_or_path!r} holds a {export_format!r} export, which cannot be loaded with `backend={backend!r}`."
+            )
+        if plan.file_name is not None and plan.file_name != export_graph_name(self._export_directory):
+            raise ValueError(
+                f"{plan.file_name!r} is not the graph of the export in {self._export_directory.as_posix()!r}. "
+                "Another file of an export of the whole model cannot be loaded: load an export saved in a `subfolder`."
+            )
+        self._exported_model = AutoExportedModel.from_pretrained(
+            model_name_or_path,
+            subfolder=plan.subfolder,
+            token=token,
+            revision=revision,
+            cache_dir=cache_folder,
+            **runner_kwargs,
+        )
+
+    def _forward_exported(self, features: dict[str, Any]) -> dict[str, Any]:
+        """Run the exported graph on the tensors among the features it takes, and return the features with its outputs."""
+        exported_model = self._exported_model
+        missing = [name for name in exported_model.input_names if name not in features]
+        if missing:
+            raise ValueError(
+                f"The exported model requires the features {list(exported_model.input_names)}, but {missing} are "
+                f"missing from the preprocessed inputs {sorted(features)}."
+            )
+        inputs = {
+            name: value
+            for name, value in features.items()
+            if isinstance(value, Tensor) and exported_model.runner.declares(name, value)
+        }
+        outputs = exported_model(**inputs)
+        return {**features, **outputs}
 
     def compile(self, *args, **kwargs) -> None:
         """
@@ -769,6 +866,9 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
 
         with open(os.path.join(path, "modules.json"), "w", encoding="utf8") as fOut:
             json.dump(modules_config, fOut, indent=2)
+
+        if self._exported_model is not None:
+            save_export(self._export_directory, os.path.join(path, self.backend))
 
         if create_model_card:
             self._create_model_card(path, model_name, train_datasets)
@@ -1262,7 +1362,7 @@ This pull request has been automatically generated to add {self.__class__.__name
                         model_kwargs=model_kwargs,
                         processor_kwargs=processor_kwargs,
                         config_kwargs=config_kwargs,
-                        backend=self.backend,
+                        backend=self._module_backend,
                     )
 
                     # Remap new-style keys back to old-style for old custom modules.
@@ -1322,7 +1422,7 @@ This pull request has been automatically generated to add {self.__class__.__name
                     model_kwargs=model_kwargs,
                     processor_kwargs=processor_kwargs,
                     config_kwargs=config_kwargs,
-                    backend=self.backend,
+                    backend=self._module_backend,
                     **extra_load_kwargs,
                 )
 
