@@ -86,7 +86,7 @@ class SpladePooling(Module):
         attention_mask = features["attention_mask"]  # Shape: [batch_size, seq_length]
 
         # Unsqueeze attention_mask to be [batch_size, seq_length, 1] for broadcasting
-        # Casting before unsqueezing, as the reverse order is mis-converted by the OpenVINO exporter
+        # Cast before unsqueezing as reverse order results in inference mismatch for OpenVINO converted models
         attention_mask_expanded = attention_mask.to(mlm_logits.dtype).unsqueeze(-1)
 
         batch_size, seq_len, vocab_s = mlm_logits.shape
