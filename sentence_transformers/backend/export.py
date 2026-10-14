@@ -47,8 +47,6 @@ class _ExportWrapper(nn.Module):
         super().__init__()
         self.model = model
         self.output_names = output_names
-        # Saved with the export, to load it again
-        self.config = model.config
 
     def forward(self, **features: Tensor) -> dict[str, Tensor]:
         outputs = self.model(dict(features))
