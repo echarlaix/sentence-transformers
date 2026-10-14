@@ -220,8 +220,8 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         # used to keep compatibility with legacy models
         self._module_backend = backend
         export = False
-        existing_export = None
-        use_exported_model = False
+        saved_export = None
+        is_full_model_export = False
         backend_kwargs = {}
 
         if cache_folder is None:
@@ -278,8 +278,8 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         if model_name_or_path and backend != "torch":
             export_kwargs = model_kwargs or {}
             if not export_kwargs.get("export"):
-                existing_export = find_existing_export(model_name_or_path, backend, export_kwargs, token, revision)
-            if existing_export is None:
+                saved_export = find_existing_export(model_name_or_path, backend, export_kwargs, token, revision)
+            if saved_export is None:
                 if not export_kwargs.get("export") and is_legacy_export(
                     model_name_or_path, backend, export_kwargs, token, revision
                 ):
@@ -289,8 +289,8 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
                     check_can_export(model_name_or_path, backend)
                     export = True
                     logger.warning(f"Exporting the whole model to {BACKEND_NAMES[backend]}.")
-            use_exported_model = export or existing_export is not None
-            if use_exported_model:
+            is_full_model_export = export or saved_export is not None
+            if is_full_model_export:
                 self._module_backend = "torch"
                 backend_kwargs, model_kwargs = split_backend_kwargs(model_kwargs, backend)
         if model_name_or_path:
@@ -319,10 +319,8 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
 
         self._device_map = device_map
         self._modules_placed = False
-        if use_exported_model:
-            self._load_exported_model(
-                model_name_or_path, existing_export, backend_kwargs, token, revision, cache_folder
-            )
+        if is_full_model_export:
+            self._load_exported_model(model_name_or_path, saved_export, backend_kwargs, token, revision, cache_folder)
         elif self._placement_is_delegated:
             self._place_modules()
         else:
@@ -637,17 +635,17 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
     def _load_exported_model(
         self,
         model_name_or_path: str,
-        existing_export: tuple[str, str | None] | None,
+        saved_export: tuple[str, str | None] | None,
         backend_kwargs: dict[str, Any],
         token: bool | str | None,
         revision: Any,
         cache_folder: str | None,
     ) -> None:
-        """Load the export of the whole model, at ``(subfolder, file_name)``, or export it first if ``existing_export`` is None."""
+        """Load the export of the whole model, at ``(subfolder, file_name)``, or export it first if ``saved_export`` is None."""
         from transformers.exporters import AutoExportedModel
 
         backend = self.backend
-        if existing_export is None:
+        if saved_export is None:
             # The temporary directory is kept until this model is collected
             self._export_temporary_directory = new_export_directory()
             self._export_directory = export_model(self, backend, self._export_temporary_directory.name)
@@ -655,7 +653,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             backend_warn_to_save(model_name_or_path, os.path.isdir(model_name_or_path), BACKEND_NAMES[backend])
             return
 
-        subfolder, file_name = existing_export
+        subfolder, file_name = saved_export
         self._export_directory = resolve_export_directory(
             model_name_or_path, subfolder, token=token, revision=revision, cache_dir=cache_folder
         )
