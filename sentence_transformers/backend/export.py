@@ -4,7 +4,6 @@ import json
 import logging
 import shutil
 import tempfile
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -72,7 +71,7 @@ def export_model(
     output_directory = Path(output_directory)
     features = model.preprocess(model._export_sample_inputs())
     sample_inputs = {key: value for key, value in features.items() if isinstance(value, Tensor)}
-    
+
     with torch.no_grad():
         outputs = model(dict(sample_inputs))
     output_names = [
@@ -85,9 +84,7 @@ def export_model(
     if backend == "onnx":
         from transformers.exporters import OnnxConfig, OnnxExporter
 
-        exporter = OnnxExporter().export(
-            wrapper, sample_inputs, config=OnnxConfig(dynamic=True, quantizer=quantizer)
-        )
+        exporter = OnnxExporter().export(wrapper, sample_inputs, config=OnnxConfig(dynamic=True, quantizer=quantizer))
     else:
         from transformers.exporters import OpenVINOConfig, OpenVINOExporter
 
@@ -99,6 +96,7 @@ def export_model(
         _rename_openvino_files(output_directory)
 
     return output_directory
+
 
 def _rename_openvino_files(directory: Path) -> None:
     """Name the OpenVINO files `openvino_model.xml` and `openvino_model.bin` and update the config to match."""
@@ -139,118 +137,56 @@ def _raise_cannot_export(model_name_or_path: str, backend_name: str) -> None:
     )
 
 
-@dataclass(frozen=True)
-class BackendPlan:
-    """How a model is loaded with a backend.
-
-    Build one with :meth:`torch`, :meth:`legacy`, :meth:`export_full` or :meth:`load_full`.
-
-    - ``"torch"``: no backend, the modules run in PyTorch.
-    - ``"legacy"``: files exported with Optimum, which only hold the Transformer model and are loaded by its module.
-    - ``"full"``: the whole model runs in the backend, from an export that is made (``export``) or already exists
-      (in ``subfolder``, with ``file_name`` as the graph if it isn't the default one).
-
-    ``message`` is a warning for the caller to log, and doesn't take part in comparisons.
-    """
-
-    mode: Literal["torch", "full", "legacy"]
-    export: bool = False
-    file_name: str | None = None
-    subfolder: str | None = None
-    message: str | None = field(default=None, compare=False)
-
-    def __post_init__(self) -> None:
-        if self.mode not in ("torch", "full", "legacy"):
-            raise ValueError(f"Unknown backend plan mode {self.mode!r}.")
-        if self.mode != "full" and (self.export or self.file_name is not None or self.subfolder is not None):
-            raise ValueError(f"A {self.mode!r} backend plan cannot export or point to an export of the whole model.")
-        if self.export and (self.file_name is not None or self.subfolder is not None):
-            raise ValueError("A backend plan that exports the whole model cannot point to an existing export.")
-
-    @classmethod
-    def torch(cls) -> BackendPlan:
-        return cls("torch")
-
-    @classmethod
-    def legacy(cls, message: str | None = None) -> BackendPlan:
-        return cls("legacy", message=message)
-
-    @classmethod
-    def export_full(cls, message: str | None = None) -> BackendPlan:
-        return cls("full", export=True, message=message)
-
-    @classmethod
-    def load_full(cls, subfolder: str | None = None, file_name: str | None = None) -> BackendPlan:
-        return cls("full", subfolder=subfolder, file_name=file_name)
-
-    @property
-    def is_full(self) -> bool:
-        return self.mode == "full"
-
-    def split_model_kwargs(
-        self, backend: str, model_kwargs: dict[str, Any] | None
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Split ``model_kwargs`` into the ones for the runtime of the backend and the ones for the modules.
-
-        Only the whole model runs in the backend: with another plan, all of ``model_kwargs`` is for the modules.
-        """
-        if not self.is_full:
-            return {}, dict(model_kwargs or {})
-        backend_kwargs, model_kwargs = split_backend_kwargs(model_kwargs)
-        if backend == "openvino" and "device" in model_kwargs:
-            backend_kwargs["device"] = model_kwargs.pop("device")
-        return backend_kwargs, model_kwargs
+def _export_candidates(model_kwargs: dict[str, Any], backend: str) -> list[Path]:
+    """The directories that may hold an export of the whole model, by order of preference."""
+    subfolder = model_kwargs.get("subfolder") or ""
+    file_name = model_kwargs.get("file_name")
+    if file_name is not None and len(Path(file_name).parts) > 1:
+        return [Path(subfolder, *Path(file_name).parts[:-1])]
+    return [Path(subfolder), Path(subfolder, backend)]
 
 
-@dataclass(frozen=True)
-class _ExportRequest:
-    """What ``model_kwargs`` asks for an export of the whole model."""
-
-    export: bool = False
-    subfolder: str = ""
-    file_name: str | None = None
-
-    @classmethod
-    def from_model_kwargs(cls, model_kwargs: dict[str, Any]) -> _ExportRequest:
-        return cls(
-            export=bool(model_kwargs.get("export")),
-            subfolder=model_kwargs.get("subfolder") or "",
-            file_name=model_kwargs.get("file_name"),
-        )
-
-    def candidates(self, backend: str) -> list[Path]:
-        """The directories that may hold the export, by order of preference."""
-        if self.file_name is not None and len(Path(self.file_name).parts) > 1:
-            return [Path(self.subfolder, *Path(self.file_name).parts[:-1])]
-        return [Path(self.subfolder), Path(self.subfolder, backend)]
-
-
-def _find_existing_export(
-    model_name_or_path: str, candidates: list[Path], token: bool | str | None, revision: Any
-) -> Path | None:
-    """The first candidate directory, local or on the Hub, that holds the config of an export of the whole model."""
-    load_path = Path(model_name_or_path)
-    if load_path.exists():
-        return next((c for c in candidates if (load_path / c / EXPORT_CONFIG_FILE).exists()), None)
-    repo_files = set(
-        list_repo_files(
-            load_path.as_posix(),
-            repo_type="model",
-            revision=getattr(revision, "resolved", revision),
-            token=token,
-        )
-    )
-    return next((c for c in candidates if (c / EXPORT_CONFIG_FILE).as_posix() in repo_files), None)
-
-
-def _is_legacy_export(
+def find_existing_export(
     model_name_or_path: str,
     backend: str,
     model_kwargs: dict[str, Any],
-    token: bool | str | None,
-    revision: Any,
+    token: bool | str | None = None,
+    revision: Any = None,
+) -> tuple[str, str | None] | None:
+    """Look for an export of the whole model in ``model_name_or_path``, local or on the Hub.
+
+    Returns:
+        The ``(subfolder, file_name)`` of the export, with ``file_name`` None for the default graph,
+        or None if there is no export of the whole model.
+    """
+    candidates = _export_candidates(model_kwargs, backend)
+    load_path = Path(model_name_or_path)
+    if load_path.exists():
+        subfolder = next((c for c in candidates if (load_path / c / EXPORT_CONFIG_FILE).exists()), None)
+    else:
+        repo_files = set(
+            list_repo_files(
+                load_path.as_posix(),
+                repo_type="model",
+                revision=getattr(revision, "resolved", revision),
+                token=token,
+            )
+        )
+        subfolder = next((c for c in candidates if (c / EXPORT_CONFIG_FILE).as_posix() in repo_files), None)
+    if subfolder is None:
+        return None
+    file_name = model_kwargs.get("file_name")
+    return subfolder.as_posix(), Path(file_name).name if file_name is not None else None
+
+
+def is_legacy_export(
+    model_name_or_path: str,
+    backend: str,
+    model_kwargs: dict[str, Any],
+    token: bool | str | None = None,
+    revision: Any = None,
 ) -> bool:
-    """Whether the files to load were exported with Optimum, which only holds the Transformer model."""
+    """Whether the files to load were exported by a previous version of sentence-transformers, which only exported the Transformer model."""
     load_path = Path(model_name_or_path)
     legacy_kwargs = {key: model_kwargs[key] for key in ("file_name", "subfolder") if key in model_kwargs}
     legacy_kwargs.update(token=token, revision=revision)
@@ -265,57 +201,39 @@ def _is_legacy_export(
     return not should_export
 
 
-def resolve_backend_plan(
-    model_name_or_path: str,
-    backend: str,
-    model_kwargs: dict[str, Any] | None,
-    token: bool | str | None = None,
-    revision: Any = None,
-) -> BackendPlan:
-    """Decide how to load ``model_name_or_path`` with ``backend``.
-
-    Raises an ``ImportError`` if the whole model has to be exported but cannot be. Warnings are not logged here: they
-    are in ``BackendPlan.message``.
-    """
-    if backend == "torch":
-        return BackendPlan.torch()
-
-    model_kwargs = model_kwargs or {}
-    backend_name = BACKEND_NAMES[backend]
+def legacy_export_message(model_name_or_path: str, backend: str) -> str:
+    """The warning for loading files exported by a previous version of sentence-transformers, which only exported the Transformer model."""
     available, reason = is_transformers_export_available(backend)
-    request = _ExportRequest.from_model_kwargs(model_kwargs)
+    advice = (
+        'To export the whole model instead, load the model with `model_kwargs={"export": True}` '
+        "and save it with `save_pretrained()`."
+        if available
+        else f"To export the whole model instead, {reason}."
+    )
+    return (
+        f"The {BACKEND_NAMES[backend]} model in {model_name_or_path!r} was exported with a previous version of "
+        f"sentence-transformers, so it only contains the Transformer model: the other modules (e.g. pooling and normalization) run in PyTorch. {advice}"
+    )
 
-    if not request.export:
-        candidates = request.candidates(backend)
-        subfolder = _find_existing_export(model_name_or_path, candidates, token, revision)
-        if subfolder is not None:
-            file_name = Path(request.file_name).name if request.file_name is not None else None
-            return BackendPlan.load_full(subfolder.as_posix(), file_name)
 
-        # Files exported with Optimum are loaded with Optimum
-        if _is_legacy_export(model_name_or_path, backend, model_kwargs, token, revision):
-            advice = (
-                'To export the whole model instead, load the model with `model_kwargs={"export": True}` '
-                "and save it with `save_pretrained()`."
-                if available
-                else f"To export the whole model instead, {reason}."
-            )
-            return BackendPlan.legacy(
-                f"The {backend_name} model in {model_name_or_path!r} was exported with Optimum, so it only contains the "
-                f"Transformer model: the other modules (e.g. pooling and normalization) run in PyTorch. {advice}"
-            )
-
+def check_can_export(model_name_or_path: str, backend: str) -> None:
+    """Raise an ``ImportError`` if the whole model cannot be exported with ``backend``."""
+    available, reason = is_transformers_export_available(backend)
     if not available:
         raise ImportError(
-            f"No {backend_name} model was found in {model_name_or_path!r} to load, and it cannot be exported: {reason}."
+            f"No {BACKEND_NAMES[backend]} model was found in {model_name_or_path!r} to load, "
+            f"and it cannot be exported: {reason}."
         )
-    return BackendPlan.export_full(f"Exporting the whole model to {backend_name}.")
 
 
-def split_backend_kwargs(model_kwargs: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]]:
+def split_backend_kwargs(
+    model_kwargs: dict[str, Any] | None, backend: str | None = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Split ``model_kwargs`` into the ones for the backend runtime and the ones for ``from_pretrained``."""
     model_kwargs = dict(model_kwargs or {})
     backend_kwargs = {key: model_kwargs.pop(key) for key in BACKEND_MODEL_KWARGS if key in model_kwargs}
+    if backend == "openvino" and "device" in model_kwargs:
+        backend_kwargs["device"] = model_kwargs.pop("device")
     return backend_kwargs, model_kwargs
 
 

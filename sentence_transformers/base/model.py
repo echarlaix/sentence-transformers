@@ -40,14 +40,17 @@ from transformers.utils import logging as transformers_logging
 from sentence_transformers import __version__
 from sentence_transformers.backend.export import (
     BACKEND_NAMES,
-    BackendPlan,
-    export_model,
+    check_can_export,
     export_graph_name,
+    export_model,
+    find_existing_export,
+    is_legacy_export,
+    legacy_export_message,
     new_export_directory,
     read_export_config,
-    resolve_backend_plan,
     resolve_export_directory,
     save_export,
+    split_backend_kwargs,
 )
 from sentence_transformers.backend.utils import backend_warn_to_save
 from sentence_transformers.base.evaluation import BaseEvaluator
@@ -216,7 +219,9 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         self._export_temporary_directory = None
         # used to keep compatibility with legacy models
         self._module_backend = backend
-        backend_plan = BackendPlan.torch()
+        export = False
+        existing_export = None
+        use_exported_model = False
         backend_kwargs = {}
 
         if cache_folder is None:
@@ -271,14 +276,23 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
                 "`model_name_or_path`, so the `modules` argument is ignored."
             )
         if model_name_or_path and backend != "torch":
-            backend_plan = resolve_backend_plan(
-                model_name_or_path, backend, model_kwargs, token=token, revision=revision
-            )
-            if backend_plan.message:
-                logger.warning(backend_plan.message)
-            if backend_plan.is_full:
+            export_kwargs = model_kwargs or {}
+            if not export_kwargs.get("export"):
+                existing_export = find_existing_export(model_name_or_path, backend, export_kwargs, token, revision)
+            if existing_export is None:
+                if not export_kwargs.get("export") and is_legacy_export(
+                    model_name_or_path, backend, export_kwargs, token, revision
+                ):
+                    # Files exported by a previous version of sentence-transformers only hold the Transformer model, and are loaded by its module
+                    logger.warning(legacy_export_message(model_name_or_path, backend))
+                else:
+                    check_can_export(model_name_or_path, backend)
+                    export = True
+                    logger.warning(f"Exporting the whole model to {BACKEND_NAMES[backend]}.")
+            use_exported_model = export or existing_export is not None
+            if use_exported_model:
                 self._module_backend = "torch"
-                backend_kwargs, model_kwargs = backend_plan.split_model_kwargs(backend, model_kwargs)
+                backend_kwargs, model_kwargs = split_backend_kwargs(model_kwargs, backend)
         if model_name_or_path:
             modules, self.module_kwargs = self._load_modules(
                 model_name_or_path,
@@ -305,8 +319,10 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
 
         self._device_map = device_map
         self._modules_placed = False
-        if backend_plan.is_full:
-            self._load_exported_model(model_name_or_path, backend_plan, backend_kwargs, token, revision, cache_folder)
+        if use_exported_model:
+            self._load_exported_model(
+                model_name_or_path, existing_export, backend_kwargs, token, revision, cache_folder
+            )
         elif self._placement_is_delegated:
             self._place_modules()
         else:
@@ -621,17 +637,17 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
     def _load_exported_model(
         self,
         model_name_or_path: str,
-        plan: BackendPlan,
+        existing_export: tuple[str, str | None] | None,
         backend_kwargs: dict[str, Any],
         token: bool | str | None,
         revision: Any,
         cache_folder: str | None,
     ) -> None:
-        """Load the export of the whole model, which is exported first (from the modules of this model) if needed."""
+        """Load the export of the whole model, at ``(subfolder, file_name)``, or export it first if ``existing_export`` is None."""
         from transformers.exporters import AutoExportedModel
 
         backend = self.backend
-        if plan.export:
+        if existing_export is None:
             # The temporary directory is kept until this model is collected
             self._export_temporary_directory = new_export_directory()
             self._export_directory = export_model(self, backend, self._export_temporary_directory.name)
@@ -639,26 +655,27 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             backend_warn_to_save(model_name_or_path, os.path.isdir(model_name_or_path), BACKEND_NAMES[backend])
             return
 
+        subfolder, file_name = existing_export
         self._export_directory = resolve_export_directory(
-            model_name_or_path, plan.subfolder, token=token, revision=revision, cache_dir=cache_folder
+            model_name_or_path, subfolder, token=token, revision=revision, cache_dir=cache_folder
         )
         export_format = read_export_config(self._export_directory)["export_format"]
         if export_format != backend:
             raise ValueError(
                 f"{model_name_or_path!r} holds a {export_format!r} export, which cannot be loaded with `backend={backend!r}`."
             )
-        if plan.file_name is not None and plan.file_name != export_graph_name(self._export_directory):
+        if file_name is not None and file_name != export_graph_name(self._export_directory):
             raise ValueError(
-                f"{plan.file_name!r} is not the graph of the export in {self._export_directory.as_posix()!r}. "
+                f"{file_name!r} is not the graph of the export in {self._export_directory.as_posix()!r}. "
                 "Another file of an export of the whole model cannot be loaded: load an export saved in a `subfolder`."
             )
         self._exported_model = AutoExportedModel.from_pretrained(
             model_name_or_path,
-            subfolder=plan.subfolder,
+            subfolder=subfolder,
             token=token,
             revision=revision,
             cache_dir=cache_folder,
-            **runner_kwargs,
+            **backend_kwargs,
         )
 
     def _forward_exported(self, features: dict[str, Any]) -> dict[str, Any]:
