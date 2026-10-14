@@ -23,6 +23,11 @@ def load_onnx_model(model_name_or_path: str, config: PretrainedConfig, task_name
         task_name (str): The task name for the model (e.g. 'feature-extraction', 'fill-mask', 'sequence-classification').
         model_kwargs (dict): Additional keyword arguments for the model loading.
     """
+    logger.warning(
+        "This ONNX model only exports part of the model (the transformer), rather than the whole model. "
+        "Loading such models is deprecated and will be removed in a future release. "
+        "Please consider re-exporting your model to export the full model."
+    )
     try:
         import onnxruntime as ort
         from optimum.onnxruntime import (
@@ -95,6 +100,11 @@ def load_openvino_model(model_name_or_path: str, config: PretrainedConfig, task_
         task_name (str): The task name for the model (e.g. 'feature-extraction', 'fill-mask', 'sequence-classification').
         model_kwargs (dict): Additional keyword arguments for the model loading.
     """
+    logger.warning(
+        "This OpenVINO model only exports part of the model (the transformer), rather than the whole model. "
+        "Loading such models is deprecated and will be removed in a future release. "
+        "Please consider re-exporting your model to export the full model."
+    )
     try:
         from optimum.intel.openvino import (
             OV_XML_FILE_NAME,
