@@ -6,7 +6,6 @@ from pathlib import Path
 
 from transformers.configuration_utils import PretrainedConfig
 
-from sentence_transformers.backend.export import _raise_cannot_export
 from sentence_transformers.backend.utils import _save_pretrained_wrapper, backend_should_export
 
 logger = logging.getLogger(__name__)
@@ -15,6 +14,9 @@ logger = logging.getLogger(__name__)
 def load_onnx_model(model_name_or_path: str, config: PretrainedConfig, task_name: str, **model_kwargs):
     """
     Load legacy ONNX model using the Optimum library.
+
+    Deprecated: only loads a Transformer model exported by a previous version of sentence-transformers.
+    Load the whole model with ``backend="onnx"`` to export it instead.
 
     Args:
         model_name_or_path (str): The model name on Hugging Face (e.g. 'naver/splade-cocondenser-ensembledistil')
@@ -73,7 +75,11 @@ def load_onnx_model(model_name_or_path: str, config: PretrainedConfig, task_name
     )
 
     if export:
-        _raise_cannot_export(model_name_or_path, backend_name)
+        raise ValueError(
+            f"No ONNX model was found in {model_name_or_path!r}. `load_onnx_model` is deprecated: and loads "
+            "legacy model exported by a previous version of sentence-transformers, exporting a Transformer model alone is deprecated. "
+            'To export the whole model instead, load it with `model_kwargs={"export": True}` and save it with `save_pretrained().'
+        )
 
     # Load legacy model using optimum
     model = model_cls.from_pretrained(
@@ -92,6 +98,9 @@ def load_onnx_model(model_name_or_path: str, config: PretrainedConfig, task_name
 def load_openvino_model(model_name_or_path: str, config: PretrainedConfig, task_name: str, **model_kwargs):
     """
     Load legacy OpenVINO model using the Optimum library.
+
+    Deprecated: only loads a Transformer model exported by a previous version of sentence-transformers.
+    Load the whole model with ``backend="openvino"`` to export it instead.
 
     Args:
         model_name_or_path (str): The model name on Hugging Face (e.g. 'naver/splade-cocondenser-ensembledistil')
@@ -145,7 +154,11 @@ def load_openvino_model(model_name_or_path: str, config: PretrainedConfig, task_
     )
 
     if export:
-        _raise_cannot_export(model_name_or_path, backend_name)
+        raise ValueError(
+            f"No OpenVINO model was found in {model_name_or_path!r}. `load_openvino_model` is deprecated: and loads "
+            "legacy model exported by a previous version of sentence-transformers, exporting a Transformer model alone is deprecated. "
+            'To export the whole model instead, load it with `model_kwargs={"export": True}` and save it with `save_pretrained().'
+        )
 
     # ov_config can be either a dictionary, or point to a json file with an OpenVINO config,
     # at which point we load the config dict from the file

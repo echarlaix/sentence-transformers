@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -16,6 +15,8 @@ from torch import Tensor, nn
 from sentence_transformers.backend.utils import backend_should_export
 
 if TYPE_CHECKING:
+    from transformers.exporters import ExportArtifacts
+
     from sentence_transformers.base.model import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -28,14 +29,11 @@ BACKEND_NAMES = {"onnx": "ONNX", "openvino": "OpenVINO"}
 MIN_TRANSFORMERS_VERSION = "5.19.0.dev0"
 
 
-def is_transformers_export_available(backend: str | None = None) -> tuple[bool, str]:
+def is_transformers_export_available() -> tuple[bool, str]:
+    """Whether the installed ``transformers`` ships the exporters and runners, with the reason if it doesn't."""
     installed = version.parse(transformers.__version__)
     if installed.release < version.parse(MIN_TRANSFORMERS_VERSION).release:
-        target = BACKEND_NAMES.get(backend, "ONNX or OpenVINO")
-        return False, (
-            f"exporting the whole model to {target} requires `transformers>={MIN_TRANSFORMERS_VERSION}` "
-            f"(found {transformers.__version__})"
-        )
+        return False, f"`transformers>={MIN_TRANSFORMERS_VERSION}` is required (found {transformers.__version__})"
     return True, ""
 
 
@@ -55,20 +53,14 @@ class _ExportWrapper(nn.Module):
 def export_model(
     model: BaseModel,
     backend: Literal["onnx", "openvino"],
-    output_directory: str | Path,
     quantizer: Any = None,
-) -> Path:
-    available, reason = is_transformers_export_available(backend)
+) -> ExportArtifacts:
+    """Export the whole model with ``backend``. The result runs as is with ``.runtime()``, or is saved to disk with
+    :func:`save_export_artifacts`."""
+    available, reason = is_transformers_export_available()
     if not available:
         raise ImportError(f"Cannot export the whole model to {BACKEND_NAMES[backend]}: {reason}.")
 
-    if model.modalities != ["text"]:
-        raise ValueError(
-            f"Exporting the whole model to {BACKEND_NAMES[backend]} is only supported for text models, "
-            f"but the model supports the modalities {model.modalities}."
-        )
-
-    output_directory = Path(output_directory)
     features = model.preprocess(model._export_sample_inputs())
     sample_inputs = {key: value for key, value in features.items() if isinstance(value, Tensor)}
 
@@ -84,18 +76,21 @@ def export_model(
     if backend == "onnx":
         from transformers.exporters import OnnxConfig, OnnxExporter
 
-        exporter = OnnxExporter().export(wrapper, sample_inputs, config=OnnxConfig(dynamic=True, quantizer=quantizer))
+        return OnnxExporter().export(wrapper, sample_inputs, config=OnnxConfig(dynamic=True, quantizer=quantizer))
     else:
         from transformers.exporters import OpenVINOConfig, OpenVINOExporter
 
-        exporter = OpenVINOExporter().export(
+        return OpenVINOExporter().export(
             wrapper, sample_inputs, config=OpenVINOConfig(dynamic=True, stateful=False, quantizer=quantizer)
         )
-    exporter.save_pretrained(output_directory)
-    if backend == "openvino":
-        _rename_openvino_files(output_directory)
 
-    return output_directory
+
+def save_export_artifacts(artifacts: ExportArtifacts, directory: str | Path, backend: str) -> None:
+    """Save an export of the whole model, with the file names that its legacy counterpart has."""
+    directory = Path(directory)
+    artifacts.save_pretrained(directory)
+    if backend == "openvino":
+        _rename_openvino_files(directory)
 
 
 def _rename_openvino_files(directory: Path) -> None:
@@ -112,11 +107,6 @@ def _rename_openvino_files(directory: Path) -> None:
         config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
 
-def new_export_directory() -> tempfile.TemporaryDirectory:
-    """A temporary directory to export to, removed when the returned object is garbage collected."""
-    return tempfile.TemporaryDirectory(prefix="sentence_transformers_export_")
-
-
 BACKEND_MODEL_KWARGS = (
     "provider",
     "provider_options",
@@ -128,57 +118,6 @@ BACKEND_MODEL_KWARGS = (
 )
 
 
-def _raise_cannot_export(model_name_or_path: str, backend_name: str) -> None:
-    raise ValueError(
-        f"No {backend_name} model was found in {model_name_or_path!r} to load with Optimum, and a Transformer model "
-        f"cannot be exported to {backend_name} on its own. Load the whole model with `backend={backend_name.lower()!r}` "
-        "(e.g. `SentenceTransformer(...)`) to export it, which requires a version of `transformers` that ships "
-        "the exporters and their runners."
-    )
-
-
-def _export_candidates(model_kwargs: dict[str, Any], backend: str) -> list[Path]:
-    """The directories that may hold an export of the whole model, by order of preference."""
-    subfolder = model_kwargs.get("subfolder") or ""
-    file_name = model_kwargs.get("file_name")
-    if file_name is not None and len(Path(file_name).parts) > 1:
-        return [Path(subfolder, *Path(file_name).parts[:-1])]
-    return [Path(subfolder), Path(subfolder, backend)]
-
-
-def find_existing_export(
-    model_name_or_path: str,
-    backend: str,
-    model_kwargs: dict[str, Any],
-    token: bool | str | None = None,
-    revision: Any = None,
-) -> tuple[str, str | None] | None:
-    """Look for an export of the whole model in ``model_name_or_path``, local or on the Hub.
-
-    Returns:
-        The ``(subfolder, file_name)`` of the export, with ``file_name`` None for the default graph,
-        or None if there is no export of the whole model.
-    """
-    candidates = _export_candidates(model_kwargs, backend)
-    load_path = Path(model_name_or_path)
-    if load_path.exists():
-        subfolder = next((c for c in candidates if (load_path / c / EXPORT_CONFIG_FILE).exists()), None)
-    else:
-        repo_files = set(
-            list_repo_files(
-                load_path.as_posix(),
-                repo_type="model",
-                revision=getattr(revision, "resolved", revision),
-                token=token,
-            )
-        )
-        subfolder = next((c for c in candidates if (c / EXPORT_CONFIG_FILE).as_posix() in repo_files), None)
-    if subfolder is None:
-        return None
-    file_name = model_kwargs.get("file_name")
-    return subfolder.as_posix(), Path(file_name).name if file_name is not None else None
-
-
 def is_legacy_export(
     model_name_or_path: str,
     backend: str,
@@ -186,7 +125,32 @@ def is_legacy_export(
     token: bool | str | None = None,
     revision: Any = None,
 ) -> bool:
-    """Whether the files to load were exported by a previous version of sentence-transformers, which only exported the Transformer model."""
+    """Whether the exported files were written by a previous version of sentence-transformers.
+
+    It only exported the Transformer model, without the ``export.json`` that an export of the whole model has
+    next to its graph, in ``<subfolder>/<backend>/``.
+    """
+    config_path = Path(model_kwargs.get("subfolder") or "", backend, EXPORT_CONFIG_FILE)
+    load_path = Path(model_name_or_path)
+    if load_path.exists():
+        return not (load_path / config_path).exists()
+    repo_files = list_repo_files(
+        load_path.as_posix(),
+        repo_type="model",
+        revision=getattr(revision, "resolved", revision),
+        token=token,
+    )
+    return config_path.as_posix() not in repo_files
+
+
+def has_exported_files(
+    model_name_or_path: str,
+    backend: str,
+    model_kwargs: dict[str, Any],
+    token: bool | str | None = None,
+    revision: Any = None,
+) -> bool:
+    """Whether the backend files (e.g. ``model.onnx``) to load are in ``model_name_or_path``, local or on the Hub."""
     load_path = Path(model_name_or_path)
     legacy_kwargs = {key: model_kwargs[key] for key in ("file_name", "subfolder") if key in model_kwargs}
     legacy_kwargs.update(token=token, revision=revision)
@@ -201,29 +165,28 @@ def is_legacy_export(
     return not should_export
 
 
-def legacy_export_message(model_name_or_path: str, backend: str) -> str:
-    """The warning for loading files exported by a previous version of sentence-transformers, which only exported the Transformer model."""
-    available, reason = is_transformers_export_available(backend)
-    advice = (
-        'To export the whole model instead, load the model with `model_kwargs={"export": True}` '
-        "and save it with `save_pretrained()`."
-        if available
-        else f"To export the whole model instead, {reason}."
-    )
-    return (
-        f"The {BACKEND_NAMES[backend]} model in {model_name_or_path!r} was exported with a previous version of "
-        f"sentence-transformers, so it only contains the Transformer model: the other modules (e.g. pooling and normalization) run in PyTorch. {advice}"
-    )
+def check_can_export(model_name_or_path: str, backend: str, export: bool) -> None:
+    """Raise an ``ImportError`` if the installed ``transformers`` cannot run the whole model with ``backend``.
 
+    Both exporting the whole model and loading an export of it need the exporters and runners of ``transformers``.
 
-def check_can_export(model_name_or_path: str, backend: str) -> None:
-    """Raise an ``ImportError`` if the whole model cannot be exported with ``backend``."""
-    available, reason = is_transformers_export_available(backend)
-    if not available:
+    Args:
+        model_name_or_path: The model name or path, for the error message.
+        backend: The backend, ``"onnx"`` or ``"openvino"``.
+        export: Whether the whole model is exported, as opposed to loading an export that exists.
+    """
+    available, reason = is_transformers_export_available()
+    if available:
+        return
+    backend_name = BACKEND_NAMES[backend]
+    if export:
         raise ImportError(
-            f"No {BACKEND_NAMES[backend]} model was found in {model_name_or_path!r} to load, "
-            f"and it cannot be exported: {reason}."
+            f"No {backend_name} model was found in {model_name_or_path!r}, and the whole model cannot be exported: "
+            f"{reason}."
         )
+    raise ImportError(
+        f"The {backend_name} model in {model_name_or_path!r} holds the whole model, which cannot be loaded: {reason}."
+    )
 
 
 def split_backend_kwargs(
@@ -242,15 +205,10 @@ def read_export_config(directory: str | Path) -> dict[str, Any]:
     return json.loads((Path(directory) / EXPORT_CONFIG_FILE).read_text(encoding="utf-8"))
 
 
-def export_graph_name(directory: str | Path) -> str:
-    """The file name of the graph of a saved export, e.g. ``model.onnx``."""
-    return read_export_config(directory)["components"]["model"]["file"]
-
-
 def export_files(directory: str | Path) -> list[Path]:
     """The files making up a saved export: the graph, its weights, ``export.json`` and ``config.json``."""
     directory = Path(directory)
-    graph = Path(export_graph_name(directory))
+    graph = Path(read_export_config(directory)["components"]["model"]["file"])
     # The weights are stored next to the graph: `model.bin`, or `model.onnx_data` / `model.onnx.data`
     weights = (
         [graph.with_suffix(".bin").name] if graph.suffix == ".xml" else [f"{graph.stem}.onnx_data", f"{graph}.data"]
