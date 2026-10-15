@@ -1,247 +1,274 @@
 from __future__ import annotations
 
-import json
-import logging
+import os
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
+import huggingface_hub
 import torch
 import transformers
-from huggingface_hub import hf_hub_download, list_repo_files
 from packaging import version
-from torch import Tensor, nn
-
-from sentence_transformers.backend.utils import backend_should_export
+from torch import nn
+from transformers.utils import logging as transformers_logging
 
 if TYPE_CHECKING:
-    from transformers.exporters import ExportArtifacts
+    from transformers.exporters import ExportArtifacts, ExportConfigMixin, ExportedModel
 
     from sentence_transformers.base.model import BaseModel
 
-logger = logging.getLogger(__name__)
+logger = transformers_logging.get_logger(__name__)
 
-EXPORT_CONFIG_FILE = "export.json"
-MODEL_FILE_NAMES = {"onnx": "model.onnx", "openvino": "openvino_model.xml"}
-MODEL_FILE_GLOBS = {"onnx": "*.onnx", "openvino": "openvino*.xml"}
-BACKEND_NAMES = {"onnx": "ONNX", "openvino": "OpenVINO"}
 # first version to include `XxxExporter`, `XxxModelRunner`, XxxQuantizer` is v5.20
 MIN_TRANSFORMERS_VERSION = "5.19.0.dev0"
+LEGACY_EXPORT_FORMATS = ["onnx", "openvino"]
+EXPORT_MANIFEST_FILE = "export.json"
+
+# Sample texts used to trace the model; two different lengths so that the sequence dimension isn't specialized
+_SAMPLE_TEXTS = ["Hello world!", "A somewhat longer sentence, so that the sequence dimension is not constant."]
 
 
-def is_transformers_export_available() -> tuple[bool, str]:
-    """Whether the installed ``transformers`` ships the exporters and runners, with the reason if it doesn't."""
+def is_transformers_export_available() -> bool:
+    """Whether the installed ``transformers`` can export a whole model and run the export."""
     installed = version.parse(transformers.__version__)
-    if installed.release < version.parse(MIN_TRANSFORMERS_VERSION).release:
-        return False, f"`transformers>={MIN_TRANSFORMERS_VERSION}` is required (found {transformers.__version__})"
-    return True, ""
+    return installed.release >= version.parse(MIN_TRANSFORMERS_VERSION).release
 
 
-class _ExportWrapper(nn.Module):
-    """Runs the modules of a model on keyword features and returns the requested output features."""
+def _import_exporters():
+    if not is_transformers_export_available():
+        raise ImportError(
+            f"Exporting or loading the whole model with the 'onnx' or 'openvino' backend requires "
+            f"`transformers>={MIN_TRANSFORMERS_VERSION}` (found {transformers.__version__}). Models exported by "
+            "previous versions of sentence-transformers can still be loaded."
+        )
+    try:
+        import transformers.exporters as exporters
+    except ImportError as exc:
+        raise ImportError(
+            "Exporting or loading a model with the 'onnx' or 'openvino' backend requires the dependencies of the "
+            "chosen format, e.g. `pip install onnx onnxscript onnxruntime` for ONNX or `pip install openvino` for "
+            "OpenVINO."
+        ) from exc
+    return exporters
 
-    def __init__(self, model: BaseModel, output_names: list[str]):
+
+def get_export_formats() -> list[str]:
+    """Return the names of the export formats registered in ``transformers.exporters``, e.g. ``["onnx", ...]``.
+
+    Without the exporters (``transformers`` is too old), only the formats of the legacy exports are returned.
+    """
+    if not is_transformers_export_available():
+        return LEGACY_EXPORT_FORMATS
+    return sorted(_import_exporters().EXPORT_BACKENDS)
+
+
+class _ExportableModel(nn.Module):
+    """
+    Wraps a model so that it can be traced: tensors in, a flat dictionary of the newly computed tensors out.
+
+    Non-tensor features (e.g. ``modality``) are not part of the graph. The inputs of the graph are the tensors that
+    were passed at export time, so the sample inputs decide which features the exported model accepts.
+    """
+
+    def __init__(self, model: BaseModel):
         super().__init__()
         self.model = model
-        self.output_names = output_names
 
-    def forward(self, **features: Tensor) -> dict[str, Tensor]:
+    def forward(self, **features: torch.Tensor) -> dict[str, torch.Tensor]:
         outputs = self.model(dict(features))
-        return {name: outputs[name] for name in self.output_names}
+        # Inputs that pass through are not outputs, but a module may replace one (e.g. the attention mask)
+        return {
+            key: value
+            for key, value in outputs.items()
+            if isinstance(value, torch.Tensor) and value is not features.get(key)
+        }
+
+
+def _sample_features(model: BaseModel) -> dict[str, torch.Tensor]:
+    """Preprocess a small batch of texts (or text pairs for cross-encoders) to trace the model with."""
+    inputs = [(text, text) for text in _SAMPLE_TEXTS] if model.model_type == "CrossEncoder" else _SAMPLE_TEXTS
+    features = model.preprocess(inputs)
+    return {key: value.to(model.device) for key, value in features.items() if isinstance(value, torch.Tensor)}
+
+
+def _resolve_export_config(export_format: str, export_config: ExportConfigMixin | dict[str, Any] | None):
+    from transformers.exporters import export_backend
+
+    config_class = export_backend(export_format, "config")
+    if export_config is None:
+        # Dynamic shapes, as texts of any batch size and length must be supported
+        return config_class(dynamic=True)
+    if isinstance(export_config, dict):
+        return config_class(**{"dynamic": True, **export_config})
+    return export_config
 
 
 def export_model(
     model: BaseModel,
-    backend: Literal["onnx", "openvino"],
-    quantizer: Any = None,
+    export_format: str = "onnx",
+    export_config: ExportConfigMixin | dict[str, Any] | None = None,
+    sample_features: dict[str, torch.Tensor] | None = None,
 ) -> ExportArtifacts:
-    """Export the whole model with ``backend``. The result runs as is with ``.runtime()``, or is saved to disk with
-    :func:`save_export_artifacts`."""
-    available, reason = is_transformers_export_available()
-    if not available:
-        raise ImportError(f"Cannot export the whole model to {BACKEND_NAMES[backend]}: {reason}.")
-
-    features = model.preprocess(model._export_sample_inputs())
-    sample_inputs = {key: value for key, value in features.items() if isinstance(value, Tensor)}
-
-    with torch.no_grad():
-        outputs = model(dict(sample_inputs))
-    output_names = [
-        name
-        for name, value in outputs.items()
-        if isinstance(value, Tensor) and not any(value is sample for sample in sample_inputs.values())
-    ]  # Outputs that are an input as it came are returned by the features of the model already
-    wrapper = _ExportWrapper(model, output_names).eval()
-
-    if backend == "onnx":
-        from transformers.exporters import OnnxConfig, OnnxExporter
-
-        return OnnxExporter().export(wrapper, sample_inputs, config=OnnxConfig(dynamic=True, quantizer=quantizer))
-    else:
-        from transformers.exporters import OpenVINOConfig, OpenVINOExporter
-
-        return OpenVINOExporter().export(
-            wrapper, sample_inputs, config=OpenVINOConfig(dynamic=True, stateful=False, quantizer=quantizer)
-        )
-
-
-def save_export_artifacts(artifacts: ExportArtifacts, directory: str | Path, backend: str) -> None:
-    """Save an export of the whole model, with the file names that its legacy counterpart has."""
-    directory = Path(directory)
-    artifacts.save_pretrained(directory)
-    if backend == "openvino":
-        _rename_openvino_files(directory)
-
-
-def _rename_openvino_files(directory: Path) -> None:
-    """Name the OpenVINO files `openvino_model.xml` and `openvino_model.bin` and update the config to match."""
-    config_path = directory / EXPORT_CONFIG_FILE
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    component = config["components"]["model"]
-    source = directory / component["file"]
-    target = source.with_name(MODEL_FILE_NAMES["openvino"])
-    if source != target:
-        source.rename(target)
-        source.with_suffix(".bin").rename(target.with_suffix(".bin"))
-        component["file"] = target.name
-        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-
-
-BACKEND_MODEL_KWARGS = (
-    "provider",
-    "provider_options",
-    "session_options",
-    "ov_config",
-    "file_name",
-    "export",
-    "subfolder",
-)
-
-
-def is_legacy_export(
-    model_name_or_path: str,
-    backend: str,
-    model_kwargs: dict[str, Any],
-    token: bool | str | None = None,
-    revision: Any = None,
-) -> bool:
-    """Whether the exported files were written by a previous version of sentence-transformers.
-
-    It only exported the Transformer model, without the ``export.json`` that an export of the whole model has
-    next to its graph, in ``<subfolder>/<backend>/``.
     """
-    config_path = Path(model_kwargs.get("subfolder") or "", backend, EXPORT_CONFIG_FILE)
-    load_path = Path(model_name_or_path)
-    if load_path.exists():
-        return not (load_path / config_path).exists()
-    repo_files = list_repo_files(
-        load_path.as_posix(),
-        repo_type="model",
-        revision=getattr(revision, "resolved", revision),
-        token=token,
-    )
-    return config_path.as_posix() not in repo_files
-
-
-def has_exported_files(
-    model_name_or_path: str,
-    backend: str,
-    model_kwargs: dict[str, Any],
-    token: bool | str | None = None,
-    revision: Any = None,
-) -> bool:
-    """Whether the backend files (e.g. ``model.onnx``) to load are in ``model_name_or_path``, local or on the Hub."""
-    load_path = Path(model_name_or_path)
-    legacy_kwargs = {key: model_kwargs[key] for key in ("file_name", "subfolder") if key in model_kwargs}
-    legacy_kwargs.update(token=token, revision=revision)
-    should_export, _ = backend_should_export(
-        load_path,
-        load_path.exists(),
-        legacy_kwargs,
-        MODEL_FILE_NAMES[backend],
-        MODEL_FILE_GLOBS[backend],
-        BACKEND_NAMES[backend],
-    )
-    return not should_export
-
-
-def check_can_export(model_name_or_path: str, backend: str, export: bool) -> None:
-    """Raise an ``ImportError`` if the installed ``transformers`` cannot run the whole model with ``backend``.
-
-    Both exporting the whole model and loading an export of it need the exporters and runners of ``transformers``.
+    Export all modules of a model as a single graph with ``transformers.exporters``.
 
     Args:
-        model_name_or_path: The model name or path, for the error message.
-        backend: The backend, ``"onnx"`` or ``"openvino"``.
-        export: Whether the whole model is exported, as opposed to loading an export that exists.
+        model: The :class:`~sentence_transformers.SentenceTransformer`, :class:`~sentence_transformers.CrossEncoder`,
+            :class:`~sentence_transformers.SparseEncoder` or :class:`~sentence_transformers.MultiVectorEncoder` to export.
+        export_format: The export format, i.e. one of the formats registered in ``transformers.exporters``
+            such as ``"onnx"`` or ``"openvino"``.
+        export_config: The export configuration, either an export config object (e.g.
+            :class:`~transformers.exporters.OnnxConfig`) or a dictionary of its arguments. Defaults to an export
+            config with dynamic shapes.
+        sample_features: The tensors to trace the model with, as returned by ``model.preprocess(...)``. Defaults to
+            the preprocessed output of two short texts (or text pairs for a cross-encoder).
+
+    Returns:
+        ExportArtifacts: The exported graph. Save it with ``save_pretrained``.
     """
-    available, reason = is_transformers_export_available()
-    if available:
-        return
-    backend_name = BACKEND_NAMES[backend]
-    if export:
-        raise ImportError(
-            f"No {backend_name} model was found in {model_name_or_path!r}, and the whole model cannot be exported: "
-            f"{reason}."
-        )
-    raise ImportError(
-        f"The {backend_name} model in {model_name_or_path!r} holds the whole model, which cannot be loaded: {reason}."
-    )
+    exporters = _import_exporters()
+    config = _resolve_export_config(export_format, export_config)
+    exporter = exporters.AutoHfExporter.from_config(config)
+    if sample_features is None:
+        sample_features = _sample_features(model)
+
+    return exporter.export(_ExportableModel(model), sample_features, config)
 
 
-def split_backend_kwargs(
-    model_kwargs: dict[str, Any] | None, backend: str | None = None
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Split ``model_kwargs`` into the ones for the backend runtime and the ones for ``from_pretrained``."""
-    model_kwargs = dict(model_kwargs or {})
-    backend_kwargs = {key: model_kwargs.pop(key) for key in BACKEND_MODEL_KWARGS if key in model_kwargs}
-    if backend == "openvino" and "device" in model_kwargs:
-        backend_kwargs["device"] = model_kwargs.pop("device")
-    return backend_kwargs, model_kwargs
+class ExportedModule:
+    """
+    Runs an exported graph in place of the forward pass of a model: it takes the features dictionary produced by
+    ``preprocess`` and returns it updated with the outputs of the graph, like the modules of a model do.
+    """
+
+    def __init__(
+        self,
+        model: ExportedModel,
+        export_format: str,
+        artifacts: ExportArtifacts | None = None,
+        source: tuple[str, dict[str, Any]] | None = None,
+    ):
+        self.model = model
+        self.export_format = export_format
+        # Set when the model was exported just now, saving writes these
+        self.artifacts = artifacts
+        # Set when the model was loaded: the ``(model_name_or_path, download_kwargs)`` to copy the files from
+        self.source = source
+
+    @property
+    def device(self) -> torch.device:
+        return self.model.device
+
+    def __call__(self, features: dict[str, Any], **kwargs) -> dict[str, Any]:
+        if kwargs:
+            logger.warning_once(
+                f"The forward keyword arguments {sorted(kwargs)} are ignored by the {self.export_format!r} backend, as an "
+                "exported graph is traced without them. Modules whose behaviour depends on them, e.g. the query/document "
+                "`task` of a MultiVectorEncoder, behave as if they were not set."
+            )
+        runner = self.model.runner
+        tensors = {
+            key: value
+            for key, value in features.items()
+            if isinstance(value, torch.Tensor) and runner.declares(key, value)
+        }
+        output_device = next(iter(tensors.values())).device if tensors else runner.device
+        outputs = self.model(**{key: value.to(runner.device) for key, value in tensors.items()})
+        for key, value in outputs.items():
+            features[key] = value.to(output_device) if isinstance(value, torch.Tensor) else value
+        return features
+
+    def save(self, output_path: str | os.PathLike) -> None:
+        """Save the exported graph and its manifest to ``output_path``."""
+        if self.artifacts is not None:
+            self.artifacts.save_pretrained(output_path)
+            return
+
+        from transformers.exporters.base import read_export_manifest, resolve_export_file
+
+        model_name_or_path, download_kwargs = self.source
+        manifest = read_export_manifest(model_name_or_path, **download_kwargs)
+        files = [EXPORT_MANIFEST_FILE] + [entry["file"] for entry in manifest["components"].values()]
+        # Large ONNX models keep their weights in files next to the graph, and OpenVINO has a .bin next to the .xml
+        os.makedirs(output_path, exist_ok=True)
+        for file_name in files:
+            path = resolve_export_file(model_name_or_path, file_name, **download_kwargs)
+            if path is None:
+                continue
+            shutil.copyfile(path, Path(output_path) / file_name)
+            for sibling in Path(path).parent.glob(f"{Path(file_name).stem}*"):
+                if sibling.name != Path(file_name).name and sibling.suffix in (".bin", ".data"):
+                    shutil.copyfile(sibling, Path(output_path) / sibling.name)
 
 
-def read_export_config(directory: str | Path) -> dict[str, Any]:
-    """The ``export.json`` of a saved export."""
-    return json.loads((Path(directory) / EXPORT_CONFIG_FILE).read_text(encoding="utf-8"))
+def _download_kwargs(export_format: str, **load_kwargs) -> dict[str, Any]:
+    kwargs = {
+        "cache_dir": load_kwargs.get("cache_folder"),
+        "revision": load_kwargs.get("revision"),
+        "token": load_kwargs.get("token"),
+        "local_files_only": load_kwargs.get("local_files_only", False),
+        "subfolder": export_format,
+    }
+    return {key: value for key, value in kwargs.items() if value is not None}
 
 
-def export_files(directory: str | Path) -> list[Path]:
-    """The files making up a saved export: the graph, its weights, ``export.json`` and ``config.json``."""
-    directory = Path(directory)
-    graph = Path(read_export_config(directory)["components"]["model"]["file"])
-    # The weights are stored next to the graph: `model.bin`, or `model.onnx_data` / `model.onnx.data`
-    weights = (
-        [graph.with_suffix(".bin").name] if graph.suffix == ".xml" else [f"{graph.stem}.onnx_data", f"{graph}.data"]
-    )
-    names = [graph.name, *weights, EXPORT_CONFIG_FILE, "config.json"]
-    return [directory / name for name in names if (directory / name).exists()]
+def is_transformers_exported_model(model_name_or_path: str, export_format: str, **load_kwargs) -> bool:
+    """
+    Whether ``model_name_or_path`` has an export of the whole model in its ``export_format`` subfolder.
 
-
-def save_export(source_directory: str | Path, directory: str | Path) -> None:
-    """Copy the files of a saved export into ``directory``."""
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    for source in export_files(source_directory):
-        target = directory / source.name
-        if not (target.exists() and target.samefile(source)):
-            shutil.copy(source, target)
-
-
-def resolve_export_directory(
-    model_name_or_path: str,
-    subfolder: str | None = None,
-    token: bool | str | None = None,
-    revision: Any = None,
-    cache_dir: str | None = None,
-) -> Path:
-    """The local directory of an export, in a local directory or a cached snapshot of a Hub repository."""
+    It is told by the manifest next to the graph, which the exports of previous sentence-transformers versions don't have.
+    """
+    kwargs = _download_kwargs(export_format, **load_kwargs)
+    manifest = Path(kwargs["subfolder"], EXPORT_MANIFEST_FILE)
     if Path(model_name_or_path).is_dir():
-        return Path(model_name_or_path, subfolder or "")
-    config = hf_hub_download(
-        model_name_or_path,
-        (Path(subfolder or "") / EXPORT_CONFIG_FILE).as_posix(),
-        revision=getattr(revision, "resolved", revision),
-        token=token,
-        cache_dir=cache_dir,
+        return (Path(model_name_or_path) / manifest).is_file()
+    revision = getattr(kwargs.get("revision"), "resolved", kwargs.get("revision"))
+    if kwargs.get("local_files_only"):
+        cached = huggingface_hub.try_to_load_from_cache(
+            model_name_or_path, manifest.as_posix(), cache_dir=kwargs.get("cache_dir"), revision=revision
+        )
+        return isinstance(cached, str)
+    try:
+        return huggingface_hub.file_exists(
+            model_name_or_path,
+            manifest.as_posix(),
+            revision=revision,
+            token=kwargs.get("token"),
+        )
+    except huggingface_hub.errors.HfHubHTTPError:
+        return False
+
+
+def load_exported_model(
+    model_name_or_path: str, export_format: str, device: str | torch.device | None = None, **load_kwargs
+) -> ExportedModule | None:
+    """
+    Load the whole-model export in the ``export_format`` subfolder of a local directory or Hugging Face repository.
+
+    Args:
+        model_name_or_path: Local directory or Hub model ID.
+        export_format: The export format, which is also the name of the subfolder, e.g. ``"onnx"``.
+        device: The device the exported graph should run on.
+        **load_kwargs: ``cache_folder``, ``revision``, ``token`` and ``local_files_only``.
+
+    Returns:
+        ExportedModule | None: The loaded model, or None if there is no export to load.
+    """
+    if not is_transformers_exported_model(model_name_or_path, export_format, **load_kwargs):
+        return None
+    exporters = _import_exporters()
+
+    from transformers.exporters.base import load_export_runners
+
+    download_kwargs = _download_kwargs(export_format, **load_kwargs)
+    runners = load_export_runners(model_name_or_path, device=device, **download_kwargs)
+    if len(runners) != 1:
+        raise ValueError(
+            f"Expected a single exported graph in the {export_format!r} subfolder of {model_name_or_path!r}, "
+            f"but found {len(runners)}: {sorted(runners)}."
+        )
+    return ExportedModule(
+        exporters.ExportedModel(next(iter(runners.values()))),
+        export_format,
+        source=(model_name_or_path, download_kwargs),
     )
-    return Path(config).parent

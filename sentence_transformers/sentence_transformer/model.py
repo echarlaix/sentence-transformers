@@ -1274,7 +1274,7 @@ class SentenceTransformer(BaseModel, FitMixin):
             model_kwargs=model_kwargs,
             processor_kwargs=processor_kwargs,
             config_kwargs=config_kwargs,
-            backend=self._module_backend,
+            backend=self.backend,
         )
         modules = [transformer_model]
         if transformer_model.module_output_name == "token_embeddings":

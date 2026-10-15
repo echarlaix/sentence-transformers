@@ -5,6 +5,7 @@ import inspect
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import fields
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, get_args, get_type_hints
 
 import torch
@@ -46,7 +47,9 @@ from transformers.utils.import_utils import is_peft_available
 from transformers.utils.peft_utils import find_adapter_config_file
 from typing_extensions import NotRequired
 
-from sentence_transformers.backend import load_onnx_model, load_openvino_model
+from sentence_transformers.backend import backend_should_export, load_onnx_model, load_openvino_model
+from sentence_transformers.backend.export import is_transformers_exported_model
+
 from sentence_transformers.base.modality import InputFormatter, format_modality, raise_unsupported_modality_error
 from sentence_transformers.base.modality_types import (
     MODALITY_TO_PROCESSOR_ARG,
@@ -58,6 +61,7 @@ from sentence_transformers.base.modality_types import (
 from sentence_transformers.base.modules.input_module import InputModule
 from sentence_transformers.util.decorators import transformer_kwargs_decorator
 from sentence_transformers.util.environment import suggest_extra_on_exception
+
 
 try:
     from typing import Self
@@ -639,6 +643,11 @@ _NON_MODEL_FEATURE_KEYS = frozenset(
         "special_tokens_mask",
     }
 )
+# Files written by the legacy exports with Optimum: (file name, glob, display name)
+_LEGACY_BACKEND_FILES = {
+    "onnx": ("model.onnx", "*.onnx", "ONNX"),
+    "openvino": ("openvino_model.xml", "openvino*.xml", "OpenVINO"),
+}
 _FORWARD_SAFETY_NET_KEYS = frozenset({"input_ids", "attention_mask", "token_type_ids", "inputs_embeds", "return_dict"})
 
 
@@ -826,6 +835,13 @@ class Transformer(InputModule):
                 "Unknown keys will be ignored. Did you mean to nest them under "
                 "'common' or a modality key ('text', 'audio', 'image', 'video')?"
             )
+        # Models exported by previous versions only have their Transformer exported, which this module loads with
+        # its backend. Otherwise the whole model is exported or loaded by the model, and this module stays in PyTorch.
+        self._legacy_backend_export = backend != "torch" and self._is_legacy_backend_export(
+            model_name_or_path, backend, model_kwargs
+        )
+        if not self._legacy_backend_export:
+            backend = "torch"
         self.backend = backend
         self.do_lower_case = do_lower_case
         self.track_media_counts = False
@@ -2310,6 +2326,34 @@ class Transformer(InputModule):
             "use_bidirectional_attention", True, _TRANSFORMERS_SUPPORTS_USE_BIDIRECTIONAL_ATTENTION, "4.56.2"
         )
         warn_if_unsupported("is_causal", False, _TRANSFORMERS_SUPPORTS_IS_CAUSAL_FALSE, "5.2.0")
+
+    @staticmethod
+    def _is_legacy_backend_export(model_name_or_path: str, backend: str, model_kwargs: dict[str, Any]) -> bool:
+        """Whether the model has files exported with ``backend`` by a previous version of sentence-transformers.
+
+        These only hold the Transformer model, without the ``export.json`` that an export of the whole model has
+        next to its graph in the ``<backend>`` subfolder. Nothing is legacy if the export is explicitly requested.
+        """
+        if model_kwargs.get("export"):
+            return False
+
+        if is_transformers_exported_model(
+            model_name_or_path,
+            backend,
+            cache_folder=model_kwargs.get("cache_dir"),
+            revision=model_kwargs.get("revision"),
+            token=model_kwargs.get("token"),
+            local_files_only=model_kwargs.get("local_files_only", False),
+        ):
+            return False
+
+        file_name, file_glob, backend_name = _LEGACY_BACKEND_FILES[backend]
+        load_path = Path(model_name_or_path)
+        legacy_kwargs = {k: model_kwargs[k] for k in ("file_name", "subfolder", "revision", "token") if k in model_kwargs}
+        should_export, _ = backend_should_export(
+            load_path, load_path.exists(), legacy_kwargs, file_name, file_glob, backend_name
+        )
+        return not should_export
 
     def _load_model(
         self,
