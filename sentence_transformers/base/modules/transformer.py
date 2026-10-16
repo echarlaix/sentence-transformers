@@ -49,7 +49,7 @@ from typing_extensions import NotRequired
 
 from sentence_transformers.backend import backend_should_export, load_onnx_model, load_openvino_model
 from sentence_transformers.backend.export import is_transformers_exported_model
-
+from sentence_transformers.backend.utils import LEGACY_BACKEND_FILES
 from sentence_transformers.base.modality import InputFormatter, format_modality, raise_unsupported_modality_error
 from sentence_transformers.base.modality_types import (
     MODALITY_TO_PROCESSOR_ARG,
@@ -643,11 +643,6 @@ _NON_MODEL_FEATURE_KEYS = frozenset(
         "special_tokens_mask",
     }
 )
-# Files written by the legacy exports with Optimum: (file name, glob, display name)
-_LEGACY_BACKEND_FILES = {
-    "onnx": ("model.onnx", "*.onnx", "ONNX"),
-    "openvino": ("openvino_model.xml", "openvino*.xml", "OpenVINO"),
-}
 _FORWARD_SAFETY_NET_KEYS = frozenset({"input_ids", "attention_mask", "token_type_ids", "inputs_embeds", "return_dict"})
 
 
@@ -2347,7 +2342,7 @@ class Transformer(InputModule):
         ):
             return False
 
-        file_name, file_glob, backend_name = _LEGACY_BACKEND_FILES[backend]
+        file_name, file_glob, backend_name = LEGACY_BACKEND_FILES[backend]
         load_path = Path(model_name_or_path)
         legacy_kwargs = {k: model_kwargs[k] for k in ("file_name", "subfolder", "revision", "token") if k in model_kwargs}
         should_export, _ = backend_should_export(
