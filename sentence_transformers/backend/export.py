@@ -105,7 +105,7 @@ def _resolve_export_config(export_format: str, export_config: ExportConfigMixin 
 
 def export_model(
     model: BaseModel,
-    export_format: str = "onnx",
+    export_format: str,
     export_config: ExportConfigMixin | dict[str, Any] | None = None,
     sample_features: dict[str, torch.Tensor] | None = None,
 ) -> ExportArtifacts:
