@@ -38,7 +38,7 @@ from transformers.dynamic_module_utils import get_relative_import_files
 from transformers.utils import logging as transformers_logging
 
 from sentence_transformers import __version__
-from sentence_transformers.backend.exporters import ExportedModule, export_model, get_export_formats, load_exported_model
+from sentence_transformers.backend.export import ExportedModule, export, get_export_formats, load_exported_model
 from sentence_transformers.backend.utils import backend_warn_to_save
 from sentence_transformers.base.evaluation import BaseEvaluator
 from sentence_transformers.base.modality import infer_batch_modality, is_message_dict, raise_unsupported_modality_error
@@ -594,15 +594,15 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         """
         Load exported model from the subfolder named after the backend, or export the model if there is none.
 
-        Models that were exported with an old Sentence Transformers version only have their Transformer module
-        exported. These are loaded by the Transformer module itself, which also runs the other modules with PyTorch.
+        Models that were exported with previous sentence-transformers version only have their Transformer module
+        exported. These are loaded by the Transformer module itself.
         """
         if any(getattr(module, "_legacy_backend_export", False) for module in self.modules()):
             return
 
         load_kwargs = {
             "token": token,
-            "cache_folder": cache_folder,
+            "cache_dir": cache_folder,
             "revision": revision,
             "local_files_only": local_files_only,
         }
@@ -614,8 +614,8 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             return
 
         logger.info(f"Exporting {model_name_or_path} with the {self.backend!r} backend.")
-        artifacts = export_model(self, self.backend, export_config=model_kwargs.get("export_config"))
-        self._exported_model = ExportedModule(artifacts.runtime(device=self.device), self.backend, artifacts=artifacts)
+        artifacts = export(self, self.backend, export_config=model_kwargs.get("export_config"))
+        self._exported_model = ExportedModule(artifacts.runtime(device=self.device), artifacts=artifacts)
         backend_warn_to_save(model_name_or_path, os.path.isdir(model_name_or_path), self.backend)
 
     def forward(self, input: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
@@ -828,7 +828,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             json.dump(modules_config, fOut, indent=2)
 
         if self._exported_model is not None:
-            self._exported_model.save(os.path.join(path, self.backend))
+            self._exported_model.save(path)
 
         if create_model_card:
             self._create_model_card(path, model_name, train_datasets)

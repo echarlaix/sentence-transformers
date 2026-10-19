@@ -48,8 +48,7 @@ from transformers.utils.peft_utils import find_adapter_config_file
 from typing_extensions import NotRequired
 
 from sentence_transformers.backend import backend_should_export, load_onnx_model, load_openvino_model
-from sentence_transformers.backend.export import is_transformers_exported_model
-from sentence_transformers.backend.utils import LEGACY_BACKEND_FILES
+from sentence_transformers.backend.export import LEGACY_BACKEND_FILES, has_export_config
 from sentence_transformers.base.modality import InputFormatter, format_modality, raise_unsupported_modality_error
 from sentence_transformers.base.modality_types import (
     MODALITY_TO_PROCESSOR_ARG,
@@ -61,7 +60,6 @@ from sentence_transformers.base.modality_types import (
 from sentence_transformers.base.modules.input_module import InputModule
 from sentence_transformers.util.decorators import transformer_kwargs_decorator
 from sentence_transformers.util.environment import suggest_extra_on_exception
-
 
 try:
     from typing import Self
@@ -123,6 +121,17 @@ if TYPE_CHECKING and is_peft_available():
     from peft import PeftConfig
 
 logger = transformers_logging.get_logger(__name__)
+
+# The ``model_kwargs`` that only the ``onnx`` and ``openvino`` backends read, which must not reach the PyTorch model
+_BACKEND_ONLY_MODEL_KWARGS = (
+    "export",
+    "export_config",
+    "file_name",
+    "provider",
+    "provider_options",
+    "session_options",
+    "ov_config",
+)
 
 _TRANSFORMERS_PROCESSOR_SUPPORTS_MODALITY_KWARGS = parse_version(transformers_version) > parse_version("4.56.1")
 _TRANSFORMERS_APPLY_CHAT_TEMPLATE_RECOMMENDS_PROCESSOR_KWARGS = parse_version(transformers_version) >= parse_version(
@@ -830,13 +839,10 @@ class Transformer(InputModule):
                 "Unknown keys will be ignored. Did you mean to nest them under "
                 "'common' or a modality key ('text', 'audio', 'image', 'video')?"
             )
-        # Models exported by previous versions only have their Transformer exported, which this module loads with
-        # its backend. Otherwise the whole model is exported or loaded by the model, and this module stays in PyTorch.
+        # Models exported by previous versions of sentence-transformers only have their Transformer exported
         self._legacy_backend_export = backend != "torch" and self._is_legacy_backend_export(
             model_name_or_path, backend, model_kwargs
         )
-        if not self._legacy_backend_export:
-            backend = "torch"
         self.backend = backend
         self.do_lower_case = do_lower_case
         self.track_media_counts = False
@@ -865,8 +871,14 @@ class Transformer(InputModule):
             # and num_labels is not specified, we default to 1 label for CrossEncoder-like behavior
             config.num_labels = 1
 
+        # Only legacy models should be loaded using load_onnx_model / load_openvino_model
+        load_backend = backend if self._legacy_backend_export else "torch"
+        load_kwargs = model_kwargs
+        if not self._legacy_backend_export:
+            # The arguments of the backends are not arguments of the PyTorch model
+            load_kwargs = {key: value for key, value in model_kwargs.items() if key not in _BACKEND_ONLY_MODEL_KWARGS}
         self.model = self._load_model(
-            model_name_or_path, transformer_task, config, backend, is_peft_model, **model_kwargs
+            model_name_or_path, transformer_task, config, load_backend, is_peft_model, **load_kwargs
         )
 
         # ``None`` = forward accepts ``**kwargs`` (pass all but undeclared ST bookkeeping).
@@ -2326,27 +2338,28 @@ class Transformer(InputModule):
     def _is_legacy_backend_export(model_name_or_path: str, backend: str, model_kwargs: dict[str, Any]) -> bool:
         """Whether the model has files exported with ``backend`` by a previous version of sentence-transformers.
 
-        These only hold the Transformer model, without the ``export.json`` that an export of the whole model has
-        next to its graph in the ``<backend>`` subfolder. Nothing is legacy if the export is explicitly requested.
+        These only hold the Transformer model in the ``<backend>`` subfolder, without the ``export.json`` that an export
+        of the whole model has at the root of the model. Nothing is legacy if the export is explicitly requested.
         """
         if model_kwargs.get("export"):
             return False
 
-        if is_transformers_exported_model(
+        # If the model was exported with transformers.exporters, it is not legacy
+        if has_export_config(
             model_name_or_path,
-            backend,
-            cache_folder=model_kwargs.get("cache_dir"),
+            cache_dir=model_kwargs.get("cache_dir"),
             revision=model_kwargs.get("revision"),
             token=model_kwargs.get("token"),
             local_files_only=model_kwargs.get("local_files_only", False),
         ):
             return False
 
-        file_name, file_glob, backend_name = LEGACY_BACKEND_FILES[backend]
+        file_name, file_glob = LEGACY_BACKEND_FILES[backend]
         load_path = Path(model_name_or_path)
         legacy_kwargs = {k: model_kwargs[k] for k in ("file_name", "subfolder", "revision", "token") if k in model_kwargs}
+        # If converted model found, it will be considered legacy
         should_export, _ = backend_should_export(
-            load_path, load_path.exists(), legacy_kwargs, file_name, file_glob, backend_name
+            load_path, load_path.exists(), legacy_kwargs, file_name, file_glob, backend
         )
         return not should_export
 

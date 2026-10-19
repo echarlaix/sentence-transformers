@@ -17,12 +17,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Files written by the legacy exports with Optimum, per backend: (file name, glob, display name)
-LEGACY_BACKEND_FILES = {
-    "onnx": ("model.onnx", "*.onnx", "ONNX"),
-    "openvino": ("openvino_model.xml", "openvino*.xml", "OpenVINO"),
-}
-
 
 def _save_pretrained_wrapper(_save_pretrained_fn: Callable, subfolder: str) -> Callable[..., None]:
     """
