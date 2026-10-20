@@ -122,17 +122,6 @@ if TYPE_CHECKING and is_peft_available():
 
 logger = transformers_logging.get_logger(__name__)
 
-# The ``model_kwargs`` that only the ``onnx`` and ``openvino`` backends read, which must not reach the PyTorch model
-_BACKEND_ONLY_MODEL_KWARGS = (
-    "export",
-    "export_config",
-    "file_name",
-    "provider",
-    "provider_options",
-    "session_options",
-    "ov_config",
-)
-
 _TRANSFORMERS_PROCESSOR_SUPPORTS_MODALITY_KWARGS = parse_version(transformers_version) > parse_version("4.56.1")
 _TRANSFORMERS_APPLY_CHAT_TEMPLATE_RECOMMENDS_PROCESSOR_KWARGS = parse_version(transformers_version) >= parse_version(
     "5.4.0.dev0"
@@ -871,12 +860,8 @@ class Transformer(InputModule):
 
         # Only legacy models should be loaded using load_onnx_model / load_openvino_model
         load_backend = backend if self._legacy_backend_export else "torch"
-        load_kwargs = model_kwargs
-        if not self._legacy_backend_export:
-            # The arguments of the backends are not arguments of the PyTorch model
-            load_kwargs = {key: value for key, value in model_kwargs.items() if key not in _BACKEND_ONLY_MODEL_KWARGS}
         self.model = self._load_model(
-            model_name_or_path, transformer_task, config, load_backend, is_peft_model, **load_kwargs
+            model_name_or_path, transformer_task, config, load_backend, is_peft_model, **model_kwargs
         )
 
         # ``None`` = forward accepts ``**kwargs`` (pass all but undeclared ST bookkeeping).

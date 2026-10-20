@@ -11,7 +11,6 @@ from sentence_transformers.backend.export import (
     has_export_config,
     is_transformers_export_available,
 )
-from sentence_transformers.base.modules import Transformer
 
 SENTENCES = ["Hello, World!", "A much longer sentence about the weather today."]
 PAIRS = [("Which planet is red?", "Mars is the red planet."), ("Which planet is red?", "Not Venus.")]
@@ -83,6 +82,7 @@ def test_legacy_export_is_loaded():
     assert type(model[0].model).__name__.startswith("OV")
     for expected_output, output in zip(compute(SentenceTransformer(LEGACY_MODEL)), compute(model)):
         assert np.allclose(expected_output, output, atol=5e-2)
+
 
 @requires_exporters
 @pytest.mark.parametrize("export_format", EXPORT_FORMATS)
