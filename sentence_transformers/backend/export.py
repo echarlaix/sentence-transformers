@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -191,7 +192,7 @@ class ExportedModule:
                     shutil.copyfile(source, target)
 
 
-def has_export_config(model_name_or_path: str | Path, **kwargs) -> bool:
+def has_export_config(model_name_or_path: str | Path, export_format: str, **kwargs) -> bool:
     """
     Whether ``model_name_or_path``, a local directory or a Hub model, holds a model exported with
     ``transformers.exporters``. It is told by its manifest (``export.json``), which the exports of previous versions of
@@ -199,15 +200,19 @@ def has_export_config(model_name_or_path: str | Path, **kwargs) -> bool:
 
     Args:
         model_name_or_path: The local directory or Hub model ID.
+        export_format: whether the model was exported to this format, e.g. ``"onnx"``.
         **kwargs: ``revision``, ``token``, ``cache_dir`` and ``local_files_only`` to locate a Hub model.
     """
     if os.path.isdir(model_name_or_path):
-        return os.path.isfile(os.path.join(model_name_or_path, EXPORT_MANIFEST_FILE))
-    try:
-        huggingface_hub.hf_hub_download(str(model_name_or_path), EXPORT_MANIFEST_FILE, **kwargs)
-        return True
-    except (huggingface_hub.errors.HfHubHTTPError, huggingface_hub.errors.LocalEntryNotFoundError):
+        manifest = Path(model_name_or_path, EXPORT_MANIFEST_FILE)
+    else:
+        try:
+            manifest = Path(huggingface_hub.hf_hub_download(str(model_name_or_path), EXPORT_MANIFEST_FILE, **kwargs))
+        except (huggingface_hub.errors.HfHubHTTPError, huggingface_hub.errors.LocalEntryNotFoundError):
+            return False  # There is no manifest, or no such model, or it is not in the cache
+    if not manifest.is_file():
         return False
+    return json.loads(manifest.read_text(encoding="utf-8")).get("export_format") == export_format
 
 
 def load_exported_model(
@@ -223,9 +228,9 @@ def load_exported_model(
         **kwargs: ``revision``, ``token``, ``cache_dir`` and ``local_files_only`` to locate the model.
 
     Returns:
-        ExportedModule: The loaded model.
+        ExportedModule | None: The loaded model, or None if the model was not exported to ``export_format``.
     """
-    if not has_export_config(model_name_or_path, **kwargs):
+    if not has_export_config(model_name_or_path, export_format, **kwargs):
         return None
     exporters = require_transformers_exporters()
 
