@@ -11,7 +11,6 @@ from sentence_transformers.backend.export import (
     has_export_config,
     is_transformers_export_available,
 )
-from sentence_transformers.base.modules import Transformer
 
 SENTENCES = ["Hello, World!", "A much longer sentence about the weather today."]
 PAIRS = [("Which planet is red?", "Mars is the red planet."), ("Which planet is red?", "Not Venus.")]
@@ -74,4 +73,3 @@ def test_saved_export_is_loaded_not_exported_again(export_format, tmp_path, monk
     outputs = compute(reloaded)
     for expected_output, output in zip(expected_output, outputs):
         assert np.allclose(expected_output, output, atol=1e-3)
-

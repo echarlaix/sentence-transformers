@@ -2347,7 +2347,9 @@ class Transformer(InputModule):
 
         file_name, file_glob = LEGACY_BACKEND_FILES[backend]
         load_path = Path(model_name_or_path)
-        legacy_kwargs = {k: model_kwargs[k] for k in ("file_name", "subfolder", "revision", "token") if k in model_kwargs}
+        legacy_kwargs = {
+            k: model_kwargs[k] for k in ("file_name", "subfolder", "revision", "token") if k in model_kwargs
+        }
         # If converted model found, it will be considered legacy
         should_export, _ = backend_should_export(
             load_path, load_path.exists(), legacy_kwargs, file_name, file_glob, backend
