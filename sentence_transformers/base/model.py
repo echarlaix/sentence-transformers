@@ -55,7 +55,7 @@ from sentence_transformers.util import (
     load_file_path,
     save_to_hub_args_decorator,
 )
-from sentence_transformers.util.file_io import _resolve_model_revision
+from sentence_transformers.util.file_io import _resolve_model_revision, _validate_relative_path
 from sentence_transformers.util.misc import ORIGINAL_TRANSFORMER_MODELS
 
 if TYPE_CHECKING:
@@ -295,6 +295,24 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
                     module.to(first_param.dtype)
             self.to(device)
         self.is_hpu_graph_enabled = False
+
+        requested_dtype = (model_kwargs or {}).get("dtype") or (model_kwargs or {}).get("torch_dtype")
+        config_dtype = (config_kwargs or {}).get("dtype") or (config_kwargs or {}).get("torch_dtype")
+        if (
+            model_name_or_path
+            and backend == "torch"
+            and requested_dtype in (None, "auto")
+            and config_dtype in (None, "auto")
+            and self.transformers_model is not None
+            and self.dtype in (torch.float16, torch.bfloat16)
+            and self.device.type == "cpu"
+            and all(parameter.device.type == "cpu" for parameter in self.parameters())
+        ):
+            logger.warning_once(
+                f"This model was loaded in {self.dtype} on CPU. Depending on your CPU, inference may be significantly "
+                "slower than with torch.float32. Consider comparing inference speeds by loading with "
+                '`model_kwargs={"dtype": torch.float32}`.'
+            )
 
         if backend != "torch" and model_name_or_path:
             self._load_or_export_backend_model(
@@ -1279,6 +1297,9 @@ This pull request has been automatically generated to add {self.__class__.__name
         )
         with open(modules_json_path, encoding="utf8") as fIn:
             modules_config = json.load(fIn)
+
+        for module_config in modules_config:
+            _validate_relative_path(module_config["path"])
 
         modules = OrderedDict()
         module_kwargs = OrderedDict()

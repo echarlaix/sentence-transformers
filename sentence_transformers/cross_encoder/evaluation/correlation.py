@@ -114,7 +114,7 @@ class CrossEncoderCorrelationEvaluator(BaseEvaluator):
             prompt_name=self.prompt_name,
             batch_size=self.batch_size,
             convert_to_numpy=True,
-            show_progress_bar=False,
+            show_progress_bar=self.show_progress_bar,
         )
 
         eval_pearson, _ = pearsonr(self.scores, pred_scores)

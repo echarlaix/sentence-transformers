@@ -612,8 +612,7 @@ def _count_media_per_sample(messages: list[list[dict[str, Any]]]) -> tuple[list[
 
     Some VLM processors flatten per-sample visual tokens into single tensors (e.g.
     ``pixel_values`` shape ``(total_visual_tokens, hidden_dim)``), losing the per-sample
-    association. By counting before the processor call, we get reliable per-sample counts
-    that downstream minibatching can use directly.
+    association. Counting the original messages preserves this association for minibatching.
     """
     num_images: list[int] = []
     num_videos: list[int] = []
@@ -845,7 +844,6 @@ class Transformer(InputModule):
         )
         self.backend = backend
         self.do_lower_case = do_lower_case
-        self.track_media_counts = False
         self._prompt_length_mapping = {}
         self._method_signature_cache: dict[str, set[str]] = {}
         self._chat_template_suffix_cache: dict[Any, list[int]] = {}
@@ -1419,15 +1417,6 @@ class Transformer(InputModule):
             processor_inputs["text"] = self.input_formatter.prepend_prompt_to_texts(processor_inputs["text"], prompt)
             prompt_length = self._get_prompt_length(prompt, **kwargs)
 
-        # Track per-sample image/video counts before the processor flattens them into single tensors.
-        # Losses that minibatch VLM inputs (e.g. CachedMNRL) use these counts to slice visual tensors.
-        # Only used if the Trainer updated track_media_counts to True. Not gated on self.training:
-        # trainer.evaluate() computes the eval loss under model.eval() and needs the counts too.
-        num_images_per_sample = None
-        num_videos_per_sample = None
-        if self.track_media_counts and modality == "message":
-            num_images_per_sample, num_videos_per_sample = _count_media_per_sample(processor_inputs["message"])
-
         with suggest_extra_on_exception():
             processor_output = self._call_processor(
                 modality,
@@ -1437,10 +1426,12 @@ class Transformer(InputModule):
                 chat_template_kwargs=chat_template_kwargs,
             )
 
-        if num_images_per_sample is not None and "image_grid_thw" in processor_output:
-            processor_output["num_images_per_sample"] = torch.tensor(num_images_per_sample, dtype=torch.long)
-        if num_videos_per_sample is not None and "video_grid_thw" in processor_output:
-            processor_output["num_videos_per_sample"] = torch.tensor(num_videos_per_sample, dtype=torch.long)
+        if modality == "message" and ("pixel_values" in processor_output or "video_grid_thw" in processor_output):
+            num_images, num_videos = _count_media_per_sample(processor_inputs["message"])
+            if "pixel_values" in processor_output:
+                processor_output["num_images_per_sample"] = torch.tensor(num_images, dtype=torch.long)
+            if "video_grid_thw" in processor_output:
+                processor_output["num_videos_per_sample"] = torch.tensor(num_videos, dtype=torch.long)
 
         if should_flatten:
             # DataCollatorWithFlattening expects list[dict], but the processor returns dict[str, list].

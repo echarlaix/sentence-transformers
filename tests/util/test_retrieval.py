@@ -70,9 +70,29 @@ def test_semantic_search_input_formats(query_format: str, corpus_format: str) ->
         assert [hit["score"] for hit in hits] == pytest.approx([hit["score"] for hit in expected_hits])
 
 
-@pytest.mark.parametrize("corpus", [torch.empty(0), np.array([])])
+@pytest.mark.parametrize("corpus", [torch.empty(0), np.array([]), []])
 def test_semantic_search_empty_corpus(corpus) -> None:
     assert semantic_search(torch.ones(2, 16), corpus) == [[], []]
+
+
+@pytest.mark.parametrize("corpus_chunk_size", [1, 7, 1000])
+@pytest.mark.parametrize("query_chunk_size", [1, 4, 100])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_semantic_search_cos_sim_matches_generic_score_function(
+    corpus_chunk_size: int, query_chunk_size: int, dtype: torch.dtype
+) -> None:
+    # cos_sim takes a faster path that normalizes each chunk once, it must return exactly what calling cos_sim does
+    generator = torch.Generator().manual_seed(0)
+    query_embeddings = torch.randn(10, 16, generator=generator).to(dtype)
+    # Coarse values and repeated rows give many tied scores, so the order of ties is checked as well
+    corpus_embeddings = torch.randint(-2, 3, (25, 16), generator=generator).to(dtype).repeat(2, 1)
+
+    kwargs = {"query_chunk_size": query_chunk_size, "corpus_chunk_size": corpus_chunk_size, "top_k": 12}
+    results = semantic_search(query_embeddings, corpus_embeddings, score_function=cos_sim, **kwargs)
+    expected = semantic_search(
+        query_embeddings, corpus_embeddings, score_function=lambda a, b: cos_sim(a, b), **kwargs
+    )
+    assert results == expected
 
 
 @pytest.mark.slow
@@ -179,6 +199,42 @@ def test_paraphrase_mining_embeddings_top_k_is_per_sentence(
     assert [score for score, _, _ in pairs] == pytest.approx([score for score, _, _ in expected])
 
 
+@pytest.mark.parametrize("corpus_chunk_size", [1, 2, 3])
+@pytest.mark.parametrize("query_chunk_size", [1, 2, 3])
+@pytest.mark.parametrize(
+    ("top_k", "expected"),
+    [
+        (0, []),
+        (1, [[6, 1, 2], [3, 0, 2]]),
+        (2, [[6, 1, 2], [3, 0, 2], [2, 0, 1]]),
+        (5, [[6, 1, 2], [3, 0, 2], [2, 0, 1]]),
+    ],
+)
+def test_paraphrase_mining_embeddings_dot_product_excludes_self(
+    query_chunk_size: int, corpus_chunk_size: int, top_k: int, expected: list[list[float | int]]
+) -> None:
+    pairs = paraphrase_mining_embeddings(
+        torch.tensor([[1.0], [2.0], [3.0]]),
+        query_chunk_size=query_chunk_size,
+        corpus_chunk_size=corpus_chunk_size,
+        top_k=top_k,
+        score_function=dot_score,
+    )
+
+    assert pairs == expected
+
+
+def test_paraphrase_mining_embeddings_preserves_score_buffer() -> None:
+    embeddings = torch.tensor([[1.0], [2.0], [3.0]])
+    scores = dot_score(embeddings, embeddings)
+    original_scores = scores.clone()
+
+    pairs = paraphrase_mining_embeddings(embeddings, top_k=1, score_function=lambda a, b: scores)
+
+    assert pairs == [[6, 1, 2], [3, 0, 2]]
+    torch.testing.assert_close(scores, original_scores)
+
+
 def test_community_detection_two_clear_communities():
     """Test case with two clear communities."""
     embeddings = torch.tensor(
@@ -282,6 +338,41 @@ def test_community_detection_overlapping_communities():
     ]
     result = community_detection(embeddings, threshold=0.8, min_community_size=2)
     assert sorted([sorted(community) for community in result]) == sorted([sorted(community) for community in expected])
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU not available"))],
+)
+@pytest.mark.parametrize("batch_size", [4, 1024])
+@pytest.mark.parametrize(
+    ("angles", "dtype", "expected"),
+    [
+        pytest.param(
+            [(0, 0), (20, 0), (-20, 0), (0, -20), (0, 22), (0, 30), (0, 36), (0, 40), (0, 44)],
+            torch.float32,
+            [[4, 0, 5, 6, 7, 8]],
+            id="claimed_center",
+        ),
+        pytest.param(
+            [(0, 25.5), (0, 50), (0, 33), (0, 40), (0, -20), (-20, -1), (0, 0), (0, -1), (20, -1), (0, 45)],
+            torch.bfloat16,
+            [[0, 1, 2, 3, 6, 9], [7, 4, 5, 8]],
+            id="tied_center",
+        ),
+    ],
+)
+def test_community_detection_preserves_centers(angles, dtype, expected, batch_size, device):
+    y, z = torch.deg2rad(torch.tensor(angles, dtype=torch.float32)).unbind(dim=1)
+    embeddings = torch.stack((y.cos() * z.cos(), y.sin() * z.cos(), z.sin()), dim=1).to(device=device, dtype=dtype)
+    result = community_detection(embeddings, threshold=0.9, min_community_size=3, batch_size=batch_size)
+
+    assert [sorted(c) for c in result] == [sorted(c) for c in expected]
+    assert [c[0] for c in result] == [c[0] for c in expected]
+    normalized = torch.nn.functional.normalize(embeddings, dim=1)
+    scores = normalized @ normalized.T
+    for community in result:
+        assert (scores[community[0], community] >= 0.9).all()
 
 
 @pytest.mark.parametrize("as_numpy", [False, True])

@@ -15,8 +15,9 @@ class PListMLELambdaWeight(nn.Module):
         Initialize a lambda weight for PListMLE loss.
 
         Args:
-            rank_discount_fn: Function that computes a discount for each rank position.
-                              If None, uses default discount of 2^(num_docs - rank) - 1.
+            rank_discount_fn: Function mapping a boolean mask of valid positions with shape
+                [batch_size, num_docs] to position weights of the same shape. The function must
+                return zero weights for padded positions. If None, uses 2^(num_docs - rank) - 1.
         """
         super().__init__()
         self.rank_discount_fn = rank_discount_fn
@@ -29,7 +30,9 @@ class PListMLELambdaWeight(nn.Module):
             mask: A boolean mask indicating valid positions [batch_size, num_docs]
 
         Returns:
-            Tensor: Weights for each position [batch_size, num_docs]
+            Tensor: Weights for each position [batch_size, num_docs]. With the default weighting,
+            long lists are rescaled by a common factor to keep the weights and their sum finite
+            without changing their relative values.
         """
         if self.rank_discount_fn is not None:
             return self.rank_discount_fn(mask)
@@ -37,9 +40,10 @@ class PListMLELambdaWeight(nn.Module):
         # Apply default rank discount: 2^(num_docs - rank) - 1, with ranks starting at 1.
         num_docs_per_query = mask.sum(dim=1, keepdim=True)
         ranks = torch.arange(1, mask.size(1) + 1, device=mask.device).expand_as(mask)
-        weights = torch.pow(2.0, num_docs_per_query - ranks) - 1.0
-        weights = weights * mask
-        return weights
+        # Rescale each row to keep its sum at most 2^127 without changing normalized weights.
+        scale = (num_docs_per_query - 127).clamp_min(0)
+        weights = torch.pow(2.0, num_docs_per_query - ranks - scale) - torch.pow(2.0, -scale)
+        return weights * mask
 
 
 class PListMLELoss(nn.Module):
@@ -113,6 +117,8 @@ class PListMLELoss(nn.Module):
         Example:
             ::
 
+                import torch
+
                 from sentence_transformers.cross_encoder import CrossEncoder, CrossEncoderTrainer, losses
                 from datasets import Dataset
 
@@ -131,8 +137,10 @@ class PListMLELoss(nn.Module):
                 loss = losses.PListMLELoss(model, lambda_weight=lambda_weight)
 
                 # or: Position-Aware ListMLE with custom weighting function
-                def custom_discount(ranks): # e.g. ranks: [1, 2, 3, 4, 5]
-                    return 1.0 / torch.log1p(ranks)
+                def custom_discount(mask):
+                    ranks = mask.cumsum(dim=-1)
+                    return (1.0 / torch.log1p(ranks)).masked_fill(~mask, 0)
+
                 lambda_weight = losses.PListMLELambdaWeight(rank_discount_fn=custom_discount)
                 loss = losses.PListMLELoss(model, lambda_weight=lambda_weight)
 

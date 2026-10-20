@@ -62,12 +62,71 @@ def test_normalize_embeddings() -> None:
         assert abs(emb_norm.item() - 1) < 0.0001
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("default_dtype", [torch.float32, torch.float64])
+def test_normalize_sparse_embeddings_preserves_dtype(dtype: torch.dtype, default_dtype: torch.dtype) -> None:
+    original_default_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(default_dtype)
+        embeddings = torch.tensor([[3.0, 4.0], [0.0, 0.0], [-4.0, 3.0]], dtype=dtype).to_sparse()
+
+        normalized = normalize_embeddings(embeddings)
+
+        assert normalized.is_sparse
+        expected = torch.tensor([[0.6, 0.8], [0.0, 0.0], [-0.8, 0.6]], dtype=dtype)
+        torch.testing.assert_close(normalized.to_dense(), expected)
+    finally:
+        torch.set_default_dtype(original_default_dtype)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("ndim", [1, 2])
+@pytest.mark.parametrize(("size", "value"), [(4096, 1.0), (2, 300.0), (2, 1e-4)])
+def test_normalize_sparse_embeddings_half_precision(
+    device: str, dtype: torch.dtype, ndim: int, size: int, value: float
+) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    dense = torch.full((size,) if ndim == 1 else (1, size), value, dtype=dtype, device=device)
+    embeddings = dense.to_sparse()
+
+    normalized = normalize_embeddings(embeddings)
+
+    expected = torch.nn.functional.normalize(dense.double(), p=2, dim=-1).to(dtype)
+    assert normalized.is_sparse
+    torch.testing.assert_close(normalized.to_dense(), expected)
+    torch.testing.assert_close(embeddings.to_dense(), dense)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+def test_normalize_sparse_embeddings_backward(dtype: torch.dtype) -> None:
+    values = torch.tensor([3.0, 4.0, -4.0, 3.0], dtype=dtype, requires_grad=True)
+    indices = torch.tensor([[0, 0, 2, 2], [0, 1, 0, 1]])
+    embeddings = torch.sparse_coo_tensor(indices, values, (3, 2))
+
+    normalize_embeddings(embeddings).to_dense().sum().backward()
+
+    expected = torch.tensor([0.032, -0.024, 0.168, 0.224], dtype=dtype)
+    torch.testing.assert_close(values.grad, expected)
+
+
 def test_normalize_embeddings_single_vector() -> None:
     embedding = torch.tensor([3.0, -4.0, 0.0])
     normalized = normalize_embeddings(embedding)
 
     assert normalized.shape == embedding.shape
     assert torch.allclose(normalized, embedding / 5.0)
+
+
+@pytest.mark.parametrize("values", [[3.0, -4.0, 0.0, 0.0], [0.0, 0.0], [], [1e-15, 0.0]])
+def test_normalize_embeddings_single_sparse_vector(values: list[float]) -> None:
+    embedding = torch.tensor(values)
+    normalized = normalize_embeddings(embedding.to_sparse())
+
+    assert normalized.is_sparse
+    assert normalized.shape == embedding.shape
+    torch.testing.assert_close(normalized.to_dense(), normalize_embeddings(embedding))
 
 
 @pytest.mark.parametrize(("array_fn", "dtype"), [(torch.tensor, torch.float32), (np.array, torch.float64)])

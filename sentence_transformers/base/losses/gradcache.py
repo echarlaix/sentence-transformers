@@ -83,6 +83,12 @@ def _get_batch_size(sentence_feature: dict[str, Any]) -> int:
     )
 
 
+# Indexed per image, not per sample, by gridless VLMs (LLaVA, Gemma3).
+_IMAGE_AXIS_KEYS = ("pixel_values", "image_position_ids", "image_sizes")
+# Processors that pad images per sample (Idefics3, Mllama) emit these.
+_SAMPLE_FIRST_IMAGE_KEYS = ("pixel_attention_mask", "aspect_ratio_ids")
+
+
 def _create_minibatch(sentence_feature: dict[str, Any], begin: int, end: int) -> dict[str, Any]:
     """Create a mini-batch from sentence features, handling padded, flattened, and VLM inputs.
 
@@ -133,6 +139,22 @@ def _create_minibatch(sentence_feature: dict[str, Any], begin: int, end: int) ->
                 token_begin, token_end = 0, 0
             custom_ranges[pixel_key] = (token_begin, token_end)
 
+        num_images = sentence_feature.get("num_images_per_sample")
+        pixel_values = sentence_feature.get("pixel_values")
+        if (
+            num_images is not None
+            and pixel_values is not None
+            and "pixel_values" not in custom_ranges
+            and not any(key in sentence_feature for key in _SAMPLE_FIRST_IMAGE_KEYS)
+            and pixel_values.shape[0] == int(num_images.sum().item())
+        ):
+            image_cumsum = num_images.cumsum(dim=0)
+            image_begin = 0 if begin == 0 else int(image_cumsum[begin - 1].item())
+            image_end = int(image_cumsum[end - 1].item())
+            for key in _IMAGE_AXIS_KEYS:
+                if key in sentence_feature:
+                    custom_ranges[key] = (image_begin, image_end)
+
         # Trim trailing padding columns so short-sequence mini-batches are not embedded at the full
         # batch width (see the docstring). Left padding is kept, to preserve length-derived positions.
         token_axis_end: int | None = None
@@ -157,7 +179,8 @@ def _create_minibatch(sentence_feature: dict[str, Any], begin: int, end: int) ->
                 result[key] = value
             elif key in custom_ranges:
                 r_begin, r_end = custom_ranges[key]
-                result[key] = value[r_begin:r_end]
+                if r_begin != r_end:
+                    result[key] = value[r_begin:r_end]
             elif token_axis_end is not None and value.ndim >= 2 and value.shape[1] == seq_width:
                 result[key] = value[begin:end, :token_axis_end]
             else:
@@ -401,10 +424,6 @@ class CachedLossMixin:
     mini_batch_size: int
     mini_batch_num_tokens: int | None = None
     show_progress_bar: bool = False
-
-    # Enables per-sample media counting in Transformer.preprocess, so that _create_minibatch can
-    # slice VLM inputs (e.g. Qwen2-VL's flattened pixel_values) along the batch dimension.
-    requires_media_counts = True
 
     # See `uses_gradient_cache`. A subclass that can turn the caching off overrides this per instance.
     uses_gradient_cache: bool = True

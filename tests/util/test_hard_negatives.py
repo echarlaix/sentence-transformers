@@ -17,12 +17,11 @@ from torch import Tensor
 
 from sentence_transformers import CrossEncoder
 from sentence_transformers.sentence_transformer.model import SentenceTransformer
-from sentence_transformers.util import cos_sim, is_datasets_available, mine_hard_negatives, pairwise_cos_sim
+from sentence_transformers.util import cos_sim, mine_hard_negatives, pairwise_cos_sim
 
-if is_datasets_available():
-    from datasets import Dataset
-else:
-    pytest.skip("The datasets library is not available.", allow_module_level=True)
+pytest.importorskip("datasets", exc_type=ModuleNotFoundError)
+
+from datasets import Dataset
 
 # Test data
 QUERIES = [
@@ -1598,12 +1597,11 @@ def test_verbose_mode(
     assert len(result) > 0
 
 
-@pytest.mark.skipif(not is_datasets_available(), reason="datasets library is not available")
-def test_mine_hard_negatives_with_prompt(paraphrase_distilroberta_base_v1_model: SentenceTransformer) -> None:
+def test_mine_hard_negatives_with_prompt(stsb_bert_tiny_model: SentenceTransformer) -> None:
     """
     Tests that mine_hard_negatives runs with and without a prompt.
     """
-    model = paraphrase_distilroberta_base_v1_model
+    model = stsb_bert_tiny_model
     # 1. Create a test dataset
     data = {
         "anchor": [

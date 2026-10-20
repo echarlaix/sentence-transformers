@@ -340,11 +340,13 @@ class TestUseCache:
 
     @pytest.mark.parametrize("use_cache", [False, True])
     def test_nested_audio_config(self, use_cache):
-        config = PretrainedConfig()
-        config.sub_configs = {"audio_config": PretrainedConfig}
-        config.audio_config = PretrainedConfig()
-        config.audio_config.sub_configs = {"codec_config": MimiConfig}
-        config.audio_config.codec_config = MimiConfig(use_cache=True)
+        class AudioConfig(PretrainedConfig):
+            sub_configs = {"codec_config": MimiConfig}
+
+        class CompositeConfig(PretrainedConfig):
+            sub_configs = {"audio_config": AudioConfig}
+
+        config = CompositeConfig(audio_config=AudioConfig(codec_config=MimiConfig(use_cache=True)))
         Transformer._configure_use_cache(config, {"use_cache": use_cache})
         assert config.audio_config.codec_config.use_cache is use_cache
         assert not hasattr(config, "use_cache")
@@ -403,7 +405,6 @@ class TestWarnOnUnsupportedAttentionConfig:
         self,
         caplog,
         monkeypatch,
-        bert_tiny_transformer,
         param,
         value,
         support_flag,
@@ -413,14 +414,17 @@ class TestWarnOnUnsupportedAttentionConfig:
         expect_warn,
     ):
         monkeypatch.setattr(transformer_module, support_flag, supports)
-        config = bert_tiny_transformer.config
+        config = PretrainedConfig()
         if set_on == "main":
             setattr(config, param, value)
         elif set_on == "sub":
-            sub = deepcopy(config)
+
+            class CompositeConfig(PretrainedConfig):
+                sub_configs = {"text_config": PretrainedConfig}
+
+            sub = PretrainedConfig()
             setattr(sub, param, value)
-            config.sub_configs = {"text_config": type(sub)}
-            config.text_config = sub
+            config = CompositeConfig(text_config=sub)
 
         with caplog.at_level(logging.WARNING):
             Transformer._warn_on_unsupported_attention_config(config)
@@ -747,6 +751,26 @@ class TestPreprocess:
         message = str(exc_info.value)
         assert "ends in a padding token" in message
         assert 'processor.tokenizer.padding_side = "left"' in message
+
+    @pytest.mark.skipif(
+        Version(transformers_version) < Version("5.0.0"), reason="any-to-any requires transformers v5+"
+    )
+    @pytest.mark.skipif(
+        not (is_vision_available() and is_torchvision_available()),
+        reason="Loading the Llava processor requires Pillow and torchvision",
+    )
+    @pytest.mark.parametrize("training", [True, False])
+    def test_num_images_per_sample_without_image_grid(self, training):
+        """Custom training loops need image counts without constructing a Trainer."""
+        from PIL import Image
+
+        transformer = Transformer(TINY_LLAVA, transformer_task="any-to-any")
+        transformer.train(training)
+        image = Image.new("RGB", (32, 32), "red")
+        features = transformer.preprocess(
+            [{"text": "a", "image": image}, {"text": "text only"}, {"text": "b", "image": [image, image]}]
+        )
+        assert features["num_images_per_sample"].tolist() == [1, 0, 2]
 
 
 class TestForward:
@@ -2169,14 +2193,15 @@ class TestCanFlattenInputs:
         assert transformer._can_flatten_inputs() is False
         assert transformer.can_flatten_inputs is False
 
-    def test_false_for_non_torch_backend(self):
+    @pytest.mark.parametrize("backend", ["onnx", "openvino"])
+    def test_false_for_non_torch_backend(self, backend):
         """Flattening requires the torch backend."""
-        try:
-            transformer = Transformer(TINY_BERT, backend="onnx")
-        except (ImportError, Exception):
-            pytest.skip("ONNX backend not available")
-        assert transformer._can_flatten_inputs() is False
-        assert transformer.can_flatten_inputs is False
+        transformer = SimpleNamespace(
+            transformer_task="feature-extraction",
+            modality_config={"text": {"method": "forward"}},
+            backend=backend,
+        )
+        assert Transformer._can_flatten_inputs(transformer) is False
 
     def test_false_when_no_flash_attention(self):
         """Without flash attention, flattening should be disabled."""
@@ -2194,10 +2219,7 @@ class TestCanFlattenInputs:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_true_with_flash_attention(self):
         """With flash attention and a compatible model, flattening should be enabled."""
-        try:
-            import kernels  # noqa: F401
-        except ImportError:
-            pytest.skip("kernels library not available")
+        pytest.importorskip("kernels", reason="kernels library not available", exc_type=ImportError)
 
         try:
             transformer = Transformer(
@@ -2253,9 +2275,9 @@ class TestConditionalFlattening:
     """Test that preprocess only flattens text-only inputs, even when can_flatten_inputs is True."""
 
     @pytest.fixture()
-    def flatten_ready_transformer(self):
+    def flatten_ready_transformer(self, bert_tiny_transformer):
         """A BERT transformer with can_flatten_inputs=True and a mock data_collator."""
-        transformer = Transformer(TINY_BERT)
+        transformer = bert_tiny_transformer
         transformer.can_flatten_inputs = True
         transformer._flatten_position_offset = transformer._infer_flatten_position_offset()
         transformer.data_collator = MagicMock(
@@ -2268,9 +2290,9 @@ class TestConditionalFlattening:
         flatten_ready_transformer.preprocess(["hello world", "another sentence"])
         flatten_ready_transformer.data_collator.assert_called_once()
 
-    def test_text_inputs_not_flattened_when_disabled(self):
+    def test_text_inputs_not_flattened_when_disabled(self, bert_tiny_transformer):
         """Text inputs should NOT be flattened when can_flatten_inputs is False."""
-        transformer = Transformer(TINY_BERT)
+        transformer = bert_tiny_transformer
         assert transformer.can_flatten_inputs is False
         transformer.data_collator = MagicMock()
         transformer.preprocess(["hello world"])

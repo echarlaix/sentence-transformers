@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -84,7 +85,7 @@ def semantic_search_qdrant(
 
         # Create new Qdrant client and collection
         client = QdrantClient(url="http://localhost:6333", **kwargs)
-        collection_name = f"sparse_collection_{int(time.time())}"
+        collection_name = f"sparse_collection_{uuid4().hex}"
 
         client.create_collection(
             collection_name=f"{collection_name}",
@@ -224,10 +225,7 @@ def semantic_search_elasticsearch(
             raise ValueError("Corpus embeddings must be a list of lists in the format [[('token', value), ...], ...]")
 
         es = Elasticsearch("http://localhost:9200", **kwargs)
-        index_name = f"sparse_index_{int(time.time())}"
-
-        if es.indices.exists(index=index_name):
-            es.indices.delete(index=index_name)
+        index_name = f"sparse_index_{uuid4().hex}"
 
         es.indices.create(
             index=index_name,
@@ -492,10 +490,7 @@ def semantic_search_opensearch(
             raise ValueError("Corpus embeddings must be a list of lists in the format [[('token', value), ...], ...]")
 
         os_client = OpenSearch("http://localhost:9200", **kwargs)
-        index_name = f"sparse_index_{int(time.time())}"
-
-        if os_client.indices.exists(index=index_name):
-            os_client.indices.delete(index=index_name)
+        index_name = f"sparse_index_{uuid4().hex}"
 
         os_client.indices.create(
             index=index_name,

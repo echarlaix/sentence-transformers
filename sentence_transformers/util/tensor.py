@@ -38,7 +38,7 @@ def _convert_to_tensor(a: list | np.ndarray | Tensor) -> Tensor:
     """
     if isinstance(a, list):
         # Check if list contains sparse tensors
-        if all(isinstance(x, Tensor) and x.is_sparse for x in a):
+        if a and all(isinstance(x, Tensor) and x.is_sparse for x in a):
             # Stack sparse tensors while preserving sparsity
             return torch.stack([x.coalesce().to(dtype=torch.float32) for x in a])
         elif a and all(isinstance(x, Tensor) for x in a):
@@ -122,7 +122,7 @@ def normalize_embeddings(embeddings: Tensor) -> Tensor:
     Normalizes the embeddings matrix, so that each sentence embedding has unit length.
 
     Args:
-        embeddings (Tensor): A dense embedding vector or a dense or sparse embeddings matrix.
+        embeddings (Tensor): A dense or sparse embedding vector or embeddings matrix.
 
     Returns:
         Tensor: The normalized embeddings, with the same shape as the input.
@@ -133,8 +133,15 @@ def normalize_embeddings(embeddings: Tensor) -> Tensor:
     embeddings = embeddings.coalesce()
     indices, values = embeddings.indices(), embeddings.values()
 
+    if embeddings.dim() == 1:
+        normalized_values = torch.nn.functional.normalize(values, p=2, dim=0)
+        return torch.sparse_coo_tensor(indices, normalized_values, embeddings.size())
+
+    if values.dtype in (torch.float16, torch.bfloat16):
+        values = values.float()
+
     # Compute row norms efficiently
-    row_norms = torch.zeros(embeddings.size(0), device=embeddings.device)
+    row_norms = values.new_zeros(embeddings.size(0))
     row_norms.index_add_(0, indices[0], values**2)
     row_norms = torch.sqrt(row_norms).index_select(0, indices[0])
 
@@ -143,7 +150,7 @@ def normalize_embeddings(embeddings: Tensor) -> Tensor:
     normalized_values = values.clone()
     normalized_values[mask] /= row_norms[mask]
 
-    return torch.sparse_coo_tensor(indices, normalized_values, embeddings.size())
+    return torch.sparse_coo_tensor(indices, normalized_values.to(embeddings.dtype), embeddings.size())
 
 
 @overload
