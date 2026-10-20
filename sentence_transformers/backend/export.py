@@ -5,11 +5,11 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import huggingface_hub
 import torch
 import transformers
 from packaging import version
 from torch import nn
-from transformers.utils import cached_file
 from transformers.utils import logging as transformers_logging
 
 if TYPE_CHECKING:
@@ -201,15 +201,12 @@ def has_export_config(model_name_or_path: str | Path, **kwargs) -> bool:
         model_name_or_path: The local directory or Hub model ID.
         **kwargs: ``revision``, ``token``, ``cache_dir`` and ``local_files_only`` to locate a Hub model.
     """
+    if os.path.isdir(model_name_or_path):
+        return os.path.isfile(os.path.join(model_name_or_path, EXPORT_MANIFEST_FILE))
     try:
-        return (
-            cached_file(
-                model_name_or_path, EXPORT_MANIFEST_FILE, _raise_exceptions_for_missing_entries=False, **kwargs
-            )
-            is not None
-        )
-    # the model does not exist
-    except OSError:
+        huggingface_hub.hf_hub_download(str(model_name_or_path), EXPORT_MANIFEST_FILE, **kwargs)
+        return True
+    except (huggingface_hub.errors.HfHubHTTPError, huggingface_hub.errors.LocalEntryNotFoundError):
         return False
 
 
