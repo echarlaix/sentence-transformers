@@ -860,8 +860,11 @@ class Transformer(InputModule):
 
         # Only legacy models should be loaded using load_onnx_model / load_openvino_model
         load_backend = backend if self._legacy_backend_export else "torch"
+        load_kwargs = model_kwargs
+        if not self._legacy_backend_export:
+            load_kwargs = {key: value for key, value in model_kwargs.items() if key != "export"}
         self.model = self._load_model(
-            model_name_or_path, transformer_task, config, load_backend, is_peft_model, **model_kwargs
+            model_name_or_path, transformer_task, config, load_backend, is_peft_model, **load_kwargs
         )
 
         # ``None`` = forward accepts ``**kwargs`` (pass all but undeclared ST bookkeeping).
@@ -2323,6 +2326,7 @@ class Transformer(InputModule):
         # If the model was exported with transformers.exporters, it is not legacy
         if has_export_config(
             model_name_or_path,
+            backend,
             cache_dir=model_kwargs.get("cache_dir"),
             revision=model_kwargs.get("revision"),
             token=model_kwargs.get("token"),
