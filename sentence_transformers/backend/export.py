@@ -86,6 +86,20 @@ def _sample_features(model: BaseModel) -> dict[str, torch.Tensor]:
     return {key: value.to(model.device) for key, value in features.items() if isinstance(value, torch.Tensor)}
 
 
+def resolve_backend(backend: str, export_config: ExportConfigMixin | dict[str, Any] | None) -> str:
+    """
+    Extract backend from ``export_config``.
+    """
+    if export_config is None:
+        return backend
+    if isinstance(export_config, dict):
+        export_format = export_config.get("export_format")
+        export_format = getattr(export_format, "value", export_format)
+    else:
+        export_format = export_config.export_format.value
+    return export_format or backend
+
+
 def _resolve_export_config(export_format: str, export_config: ExportConfigMixin | dict[str, Any] | None):
     from transformers.exporters import export_backend
 
@@ -94,7 +108,8 @@ def _resolve_export_config(export_format: str, export_config: ExportConfigMixin 
         # Dynamic shapes, as texts of any batch size and length must be supported
         return config_class(dynamic=True)
     if isinstance(export_config, dict):
-        return config_class(**{"dynamic": True, **export_config})
+        arguments = {key: value for key, value in export_config.items() if key != "export_format"}
+        return config_class(**{"dynamic": True, **arguments})
     return export_config
 
 

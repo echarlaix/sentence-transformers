@@ -38,7 +38,13 @@ from transformers.dynamic_module_utils import get_relative_import_files
 from transformers.utils import logging as transformers_logging
 
 from sentence_transformers import __version__
-from sentence_transformers.backend.export import ExportedModule, export, get_export_formats, load_exported_model
+from sentence_transformers.backend.export import (
+    ExportedModule,
+    export,
+    get_export_formats,
+    load_exported_model,
+    resolve_backend,
+)
 from sentence_transformers.backend.utils import backend_warn_to_save
 from sentence_transformers.base.evaluation import BaseEvaluator
 from sentence_transformers.base.modality import infer_batch_modality, is_message_dict, raise_unsupported_modality_error
@@ -200,6 +206,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         self.module_kwargs = None
         self._model_card_vars = {}
         self._model_card_text = None
+        backend = resolve_backend(backend, (model_kwargs or {}).get("export_config"))
         self.backend = backend
         self._exported_model = None
         if backend != "torch":
@@ -624,7 +631,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             "revision": revision,
             "local_files_only": local_files_only,
         }
-        if not model_kwargs.get("export"):
+        if not (model_kwargs.get("export") or model_kwargs.get("export_config")):
             self._exported_model = load_exported_model(
                 model_name_or_path, self.backend, device=self.device, **load_kwargs
             )

@@ -2320,7 +2320,7 @@ class Transformer(InputModule):
         These only hold the Transformer model in the ``<backend>`` subfolder, without the ``export.json`` that an export
         of the whole model has at the root of the model. Nothing is legacy if the export is explicitly requested.
         """
-        if model_kwargs.get("export"):
+        if model_kwargs.get("export") or model_kwargs.get("export_config"):
             return False
 
         # If the model was exported with transformers.exporters, it is not legacy

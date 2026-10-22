@@ -22,17 +22,9 @@ MODELS = {
     "multi_vector_encoder": (MultiVectorEncoder, "multi-vector-encoder-testing/bert-tiny-multi-vector"),
 }
 EXPORT_FORMATS = ["onnx", "openvino"]
-EXPORT_PACKAGES = ["onnxscript", "openvino"]
-# OpenVINO runs in the precision of the hardware, which can be lower than float32
-ATOL = {"onnx": 1e-3, "openvino": 1e-1}
 
 # Exported by a previous version of sentence-transformers: only its Transformer module is exported
 LEGACY_MODEL = "sentence-transformers-testing/stsb-bert-tiny-openvino"
-
-requires_exporters = pytest.mark.skipif(
-    not is_transformers_export_available() or any(importlib.util.find_spec(p) is None for p in EXPORT_PACKAGES),
-    reason=f"exporting a model requires transformers>={MIN_TRANSFORMERS_VERSION} and {EXPORT_PACKAGES}",
-)
 
 
 def has_quantizer(name: str, packages: list[str]) -> bool:
@@ -43,16 +35,22 @@ def has_quantizer(name: str, packages: list[str]) -> bool:
     return hasattr(transformers.exporters, name)
 
 
+requires_exporters = pytest.mark.skipif(
+    not is_transformers_export_available() or any(importlib.util.find_spec(p) is None for p in EXPORT_FORMATS),
+    reason=f"exporting a model requires transformers>={MIN_TRANSFORMERS_VERSION} and {EXPORT_FORMATS}",
+)
+
+
 requires_onnxruntime_quantizer = pytest.mark.skipif(
-    not has_quantizer("OnnxRuntimeQuantizer", [*EXPORT_PACKAGES, "onnxruntime"]),
+    not has_quantizer("OnnxRuntimeQuantizer", [*EXPORT_FORMATS, "onnxruntime"]),
     reason="quantizing with ONNX Runtime requires a transformers version with OnnxRuntimeQuantizer, and onnxruntime",
 )
 requires_nncf_onnx_quantizer = pytest.mark.skipif(
-    not has_quantizer("NNCFOnnxQuantizer", [*EXPORT_PACKAGES, "onnxruntime", "nncf"]),
+    not has_quantizer("NNCFOnnxQuantizer", [*EXPORT_FORMATS, "onnxruntime", "nncf"]),
     reason="quantizing with NNCF requires a transformers version with NNCFOnnxQuantizer, onnxruntime and nncf",
 )
 requires_nncf_openvino_quantizer = pytest.mark.skipif(
-    not has_quantizer("NNCFOpenVINOQuantizer", [*EXPORT_PACKAGES, "nncf"]),
+    not has_quantizer("NNCFOpenVINOQuantizer", [*EXPORT_FORMATS, "nncf"]),
     reason="quantizing with NNCF requires a transformers version with NNCFOpenVINOQuantizer and nncf",
 )
 
@@ -69,9 +67,9 @@ def compute(model) -> list[np.ndarray]:
     return [model.encode(SENTENCES)]
 
 
-def export_model(architecture, export_format, tmp_path, export_config=None):
-    """Export a model, optionally with an export config (with a quantizer) and save it. Returns the model and
-    the directory it is saved to"""
+def export_model(architecture, tmp_path, export_format="torch", export_config=None):
+    """Export a model, with an export format or an export config (e.g. one with a quantizer), and save it. Returns the
+    model and the directory it is saved to"""
     model_class, model_id = MODELS[architecture]
     model_kwargs = {"export_config": export_config} if export_config is not None else {}
     model = model_class(model_id, backend=export_format, model_kwargs=model_kwargs)
@@ -85,22 +83,22 @@ def export_model(architecture, export_format, tmp_path, export_config=None):
 def test_exported_model_matches(architecture, export_format, tmp_path):
     model_class, model_id = MODELS[architecture]
     expected = compute(model_class(model_id))
-    model, _ = export_model(architecture, export_format, tmp_path)
+    model, _ = export_model(architecture, tmp_path, export_format=export_format)
     assert model.get_backend() == export_format
     for expected_output, output in zip(expected, compute(model)):
-        assert np.allclose(expected_output, output, atol=ATOL[export_format])
+        assert np.allclose(expected_output, output, atol=1e-3)
 
 
 @requires_exporters
 @pytest.mark.parametrize("export_format", EXPORT_FORMATS)
 def test_saved_export_is_loaded_not_exported_again(export_format, tmp_path, monkeypatch):
     expected = compute(SentenceTransformer(MODELS["sentence_transformer"][1]))
-    _, directory = export_model("sentence_transformer", export_format, tmp_path)
+    _, directory = export_model("sentence_transformer", tmp_path, export_format=export_format)
     assert has_export_config(directory, export_format)
 
     reloaded = SentenceTransformer(str(directory), backend=export_format)
     for expected_output, output in zip(expected, compute(reloaded)):
-        assert np.allclose(expected_output, output, atol=ATOL[export_format])
+        assert np.allclose(expected_output, output, atol=1e-3)
 
 
 def test_legacy_export_is_loaded():
@@ -157,7 +155,7 @@ def test_onnxruntime_quantized_export(architecture, mode, tmp_path):
 
     config = OnnxRuntimeDynamicConfig() if mode == "dynamic" else OnnxRuntimeStaticConfig()
     export_config = OnnxConfig(dynamic=True, quantizer=OnnxRuntimeQuantizer(config))
-    model, directory = export_model(architecture, export_config.export_format.value, tmp_path, export_config)
+    model, directory = export_model(architecture, tmp_path, export_config=export_config)
 
     assert model.get_backend() == "onnx"
     assert onnx_op_types(directory) & QUANTIZED_ONNX_OPS
@@ -169,7 +167,7 @@ def test_nncf_quantized_onnx_export(architecture, tmp_path):
     from transformers.exporters import NNCFOnnxQuantizer, OnnxConfig
 
     export_config = OnnxConfig(dynamic=True, quantizer=NNCFOnnxQuantizer())
-    model, directory = export_model(architecture, export_config.export_format.value, tmp_path, export_config)
+    model, directory = export_model(architecture, tmp_path, export_config=export_config)
 
     assert model.get_backend() == "onnx"
     assert onnx_op_types(directory) & QUANTIZED_ONNX_OPS
@@ -183,8 +181,40 @@ def test_nncf_quantized_openvino_export(architecture, mode, tmp_path):
 
     config = NNCFWeightCompressionConfig() if mode == "weight_compression" else None
     export_config = OpenVINOConfig(dynamic=True, quantizer=NNCFOpenVINOQuantizer(config))
-    model, directory = export_model(architecture, export_config.export_format.value, tmp_path, export_config)
+    model, directory = export_model(architecture, tmp_path, export_config=export_config)
 
     assert model.get_backend() == "openvino"
     op_types = openvino_op_types(directory)
     assert "FakeQuantize" in op_types if mode == "quantization" else {"i8", "u8"} & op_types
+
+
+@requires_exporters
+@pytest.mark.parametrize("export_format", EXPORT_FORMATS)
+def test_backend_is_the_export_format_of_the_export_config(export_format):
+    from transformers.exporters import export_backend
+
+    export_config = export_backend(export_format, "config")(dynamic=True)
+    model = SentenceTransformer(MODELS["sentence_transformer"][1], model_kwargs={"export_config": export_config})
+    assert model.get_backend() == export_format
+    assert model._exported_model is not None
+
+
+@requires_exporters
+@pytest.mark.parametrize("export_format", EXPORT_FORMATS)
+def test_backend_is_the_export_format_of_the_export_config_dictionary(export_format):
+    model_kwargs = {"export_config": {"export_format": export_format, "dynamic": True}}
+    model = SentenceTransformer(MODELS["sentence_transformer"][1], model_kwargs=model_kwargs)
+    assert model.get_backend() == export_format
+    assert model._exported_model is not None
+
+
+@requires_exporters
+def test_export_config_exports_again_a_saved_export(tmp_path):
+    from transformers.exporters import OnnxConfig
+
+    _, directory = export_model("sentence_transformer", tmp_path, export_format="onnx")
+    loaded = SentenceTransformer(str(directory), backend="onnx")
+    assert loaded._exported_model.source is not None and loaded._exported_model.artifacts is None
+
+    exported = SentenceTransformer(str(directory), model_kwargs={"export_config": OnnxConfig(dynamic=True)})
+    assert exported._exported_model.artifacts is not None
