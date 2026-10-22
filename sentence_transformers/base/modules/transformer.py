@@ -862,7 +862,7 @@ class Transformer(InputModule):
         load_backend = backend if self._legacy_backend_export else "torch"
         load_kwargs = model_kwargs
         if not self._legacy_backend_export:
-            load_kwargs = {key: value for key, value in model_kwargs.items() if key != "export"}
+            load_kwargs = {key: value for key, value in model_kwargs.items() if key not in ("export", "export_config")}
         self.model = self._load_model(
             model_name_or_path, transformer_task, config, load_backend, is_peft_model, **load_kwargs
         )
