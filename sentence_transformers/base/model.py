@@ -329,6 +329,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
                 cache_folder=cache_folder,
                 revision=revision,
                 local_files_only=local_files_only,
+                device=device,
             )
 
         # Validate prompts after model loading (which may have merged config prompts)
@@ -615,6 +616,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         cache_folder: str | None,
         revision: str | None,
         local_files_only: bool,
+        device: str | torch.device | None = None,
     ) -> None:
         """
         Load exported model from the subfolder named after the backend, or export the model if there is none.
@@ -633,14 +635,14 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         }
         if not (model_kwargs.get("export") or model_kwargs.get("export_config")):
             self._exported_model = load_exported_model(
-                model_name_or_path, self.backend, device=self.device, **load_kwargs
+                model_name_or_path, self.backend, device=device, **load_kwargs
             )
         if self._exported_model is not None:
             return
 
         logger.info(f"Exporting {model_name_or_path} with the {self.backend!r} backend.")
         artifacts = export(self, self.backend, export_config=model_kwargs.get("export_config"))
-        self._exported_model = ExportedModule(artifacts.runtime(device=self.device), artifacts=artifacts)
+        self._exported_model = ExportedModule(artifacts.runtime(device=device), artifacts=artifacts)
         backend_warn_to_save(model_name_or_path, os.path.isdir(model_name_or_path), self.backend)
 
     def forward(self, input: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
@@ -1755,6 +1757,9 @@ This pull request has been automatically generated to add {self.__class__.__name
         # first parameter is not where the model runs. accelerate resolved that when it dispatched.
         if (execution_device := getattr(self._accelerate_placement_hook, "execution_device", None)) is not None:
             return torch.device(execution_device)
+
+        if getattr(self, "_exported_model", None) is not None:
+            return self._exported_model.device
 
         transformers_model = self.transformers_model
         if (device := getattr(transformers_model, "device", None)) is not None:

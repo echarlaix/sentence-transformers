@@ -4,6 +4,7 @@ import importlib.util
 
 import numpy as np
 import pytest
+from transformers import PreTrainedModel
 
 from sentence_transformers import CrossEncoder, MultiVectorEncoder, SentenceTransformer, SparseEncoder
 from sentence_transformers.backend.export import (
@@ -39,7 +40,6 @@ requires_exporters = pytest.mark.skipif(
     not is_transformers_export_available() or any(importlib.util.find_spec(p) is None for p in EXPORT_FORMATS),
     reason=f"exporting a model requires transformers>={MIN_TRANSFORMERS_VERSION} and {EXPORT_FORMATS}",
 )
-
 
 requires_onnxruntime_quantizer = pytest.mark.skipif(
     not has_quantizer("OnnxRuntimeQuantizer", [*EXPORT_FORMATS, "onnxruntime"]),
@@ -212,9 +212,12 @@ def test_backend_is_the_export_format_of_the_export_config_dictionary(export_for
 def test_export_config_exports_again_a_saved_export(tmp_path):
     from transformers.exporters import OnnxConfig
 
-    _, directory = export_model("sentence_transformer", tmp_path, export_format="onnx")
-    loaded = SentenceTransformer(str(directory), backend="onnx")
+    directory = str(tmp_path / "model")
+    SentenceTransformer(MODELS["sentence_transformer"][1]).save(directory)
+    SentenceTransformer(directory, backend="onnx").save(directory)
+
+    loaded = SentenceTransformer(directory, backend="onnx")
     assert loaded._exported_model.source is not None and loaded._exported_model.artifacts is None
 
-    exported = SentenceTransformer(str(directory), model_kwargs={"export_config": OnnxConfig(dynamic=True)})
+    exported = SentenceTransformer(directory, model_kwargs={"export_config": OnnxConfig(dynamic=True)})
     assert exported._exported_model.artifacts is not None
