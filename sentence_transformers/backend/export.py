@@ -249,7 +249,13 @@ def load_exported_model(
         return None
     exporters = require_transformers_exporters()
 
-    from transformers.exporters.base import load_export_runners
+    from transformers.exporters.base import load_export_runners, read_export_manifest, resolve_export_file
+
+    manifest = read_export_manifest(model_name_or_path, **kwargs)
+    for entry in manifest["components"].values():
+        file_name = Path(entry["file"])
+        for companion in (file_name.with_suffix(".bin"), file_name.with_name(f"{file_name.name}_data")):
+            resolve_export_file(model_name_or_path, companion.as_posix(), **kwargs)
 
     runners = load_export_runners(model_name_or_path, device=device, **kwargs)
     if len(runners) != 1:
