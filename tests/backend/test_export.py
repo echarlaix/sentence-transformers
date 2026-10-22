@@ -4,7 +4,6 @@ import importlib.util
 
 import numpy as np
 import pytest
-from transformers import PreTrainedModel
 
 from sentence_transformers import CrossEncoder, MultiVectorEncoder, SentenceTransformer, SparseEncoder
 from sentence_transformers.backend.export import (
@@ -108,7 +107,9 @@ def test_export_without_pytorch_weights_is_loaded():
     assert model._exported_model is not None
     assert model[0].model is None
     assert model.get_backend() == "openvino"
-    for expected_output, output in zip(compute(SentenceTransformer(MODELS["sentence_transformer"][1])), compute(model)):
+    for expected_output, output in zip(
+        compute(SentenceTransformer(MODELS["sentence_transformer"][1])), compute(model)
+    ):
         assert np.allclose(expected_output, output, atol=5e-2)
 
 

@@ -635,9 +635,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             "local_files_only": local_files_only,
         }
         if not (model_kwargs.get("export") or model_kwargs.get("export_config")):
-            self._exported_model = load_exported_model(
-                model_name_or_path, self.backend, device=device, **load_kwargs
-            )
+            self._exported_model = load_exported_model(model_name_or_path, self.backend, device=device, **load_kwargs)
         if self._exported_model is not None:
             return
 
