@@ -101,6 +101,17 @@ def test_saved_export_is_loaded_not_exported_again(export_format, tmp_path, monk
         assert np.allclose(expected_output, output, atol=1e-3)
 
 
+@requires_exporters
+def test_export_without_pytorch_weights_is_loaded():
+
+    model = SentenceTransformer("optimum-intel-internal-testing/stsb-bert-tiny-openvino", backend="openvino")
+    assert model._exported_model is not None
+    assert model[0].model is None
+    assert model.get_backend() == "openvino"
+    for expected_output, output in zip(compute(SentenceTransformer(MODELS["sentence_transformer"][1])), compute(model)):
+        assert np.allclose(expected_output, output, atol=5e-2)
+
+
 def test_legacy_export_is_loaded():
     pytest.importorskip("optimum.intel")
     model = SentenceTransformer(LEGACY_MODEL, backend="openvino")
