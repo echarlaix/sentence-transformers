@@ -827,6 +827,8 @@ class Transformer(InputModule):
                 "Unknown keys will be ignored. Did you mean to nest them under "
                 "'common' or a modality key ('text', 'audio', 'image', 'video')?"
             )
+        if backend != "torch" and backend not in LEGACY_BACKEND_FILES:
+            raise ValueError(f"Unsupported backend '{backend}'. `backend` should be `torch`, `onnx`, or `openvino`.")
         # The whole model was exported with transformers.exporters, which runs in place of the PyTorch model
         self._skip_torch_model = (
             backend != "torch"
