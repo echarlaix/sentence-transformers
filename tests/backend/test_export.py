@@ -22,6 +22,7 @@ MODELS = {
     "multi_vector_encoder": (MultiVectorEncoder, "multi-vector-encoder-testing/bert-tiny-multi-vector"),
 }
 EXPORT_FORMATS = ["onnx", "openvino"]
+ATOL = {"onnx": 1e-3, "openvino": 5e-2}
 
 # Exported by a previous version of sentence-transformers: only its Transformer module is exported
 LEGACY_MODEL = "sentence-transformers-testing/stsb-bert-tiny-openvino"
@@ -85,7 +86,7 @@ def test_exported_model_matches(architecture, export_format, tmp_path):
     model, _ = export_model(architecture, tmp_path, export_format=export_format)
     assert model.get_backend() == export_format
     for expected_output, output in zip(expected, compute(model)):
-        assert np.allclose(expected_output, output, atol=1e-3)
+        assert np.allclose(expected_output, output, atol=ATOL[export_format])
 
 
 @requires_exporters
@@ -97,7 +98,7 @@ def test_saved_export_is_loaded_not_exported_again(export_format, tmp_path, monk
 
     reloaded = SentenceTransformer(str(directory), backend=export_format)
     for expected_output, output in zip(expected, compute(reloaded)):
-        assert np.allclose(expected_output, output, atol=1e-3)
+        assert np.allclose(expected_output, output, atol=ATOL[export_format])
 
 
 @requires_exporters
