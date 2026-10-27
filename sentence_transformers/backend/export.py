@@ -249,17 +249,12 @@ def load_exported_model(
         return None
     exporters = require_transformers_exporters()
 
-    from transformers.exporters.base import load_export_runners, read_export_manifest, resolve_export_file
+    # Only the graph is resolved when loading, so fetch the weights stored next to it (OpenVINO ``.bin``, ONNX ``_data``)
+    manifest = exporters.base.read_export_manifest(model_name_or_path, **kwargs)
+    for component in manifest["components"].values():
+        graph = Path(component["file"])
+        for weights in (graph.with_suffix(".bin"), graph.with_name(f"{graph.name}_data")):
+            exporters.base.resolve_export_file(model_name_or_path, weights.as_posix(), **kwargs)
 
-    manifest = read_export_manifest(model_name_or_path, **kwargs)
-    for entry in manifest["components"].values():
-        file_name = Path(entry["file"])
-        for companion in (file_name.with_suffix(".bin"), file_name.with_name(f"{file_name.name}_data")):
-            resolve_export_file(model_name_or_path, companion.as_posix(), **kwargs)
-
-    runners = load_export_runners(model_name_or_path, device=device, **kwargs)
-    if len(runners) != 1:
-        raise ValueError(
-            f"Expected a single exported graph in {model_name_or_path!r}, but found {len(runners)}: {runners}."
-        )
-    return ExportedModule(exporters.ExportedModel(next(iter(runners.values()))), source=(model_name_or_path, kwargs))
+    model = exporters.AutoExportedModel.from_pretrained(model_name_or_path, device=device, **kwargs)
+    return ExportedModule(model, source=(model_name_or_path, kwargs))
