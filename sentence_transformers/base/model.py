@@ -641,7 +641,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
 
         logger.info(f"Exporting {model_name_or_path} with the {self.backend!r} backend.")
         artifacts = export(self, self.backend, export_config=model_kwargs.get("export_config"))
-        self._exported_model = ExportedModule(artifacts.runtime(device=device), artifacts=artifacts)
+        self._exported_model = ExportedModule(artifacts, device=device)
         backend_warn_to_save(model_name_or_path, os.path.isdir(model_name_or_path), self.backend)
 
     def forward(self, input: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:

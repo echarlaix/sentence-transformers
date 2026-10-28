@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -14,14 +13,14 @@ from torch import nn
 from transformers.utils import logging as transformers_logging
 
 if TYPE_CHECKING:
-    from transformers.exporters import ExportArtifacts, ExportConfigMixin, ExportedModel
+    from transformers.exporters import ExportArtifacts, ExportConfigMixin
 
     from sentence_transformers.base.model import BaseModel
 
 logger = transformers_logging.get_logger(__name__)
 
-# first version to include `XxxExporter`, `XxxModelRunner`, XxxQuantizer` is v5.20
-MIN_TRANSFORMERS_VERSION = "5.19.0.dev0"
+# `ExportArtifacts` introduced in v5.21
+MIN_TRANSFORMERS_VERSION = "5.21"
 LEGACY_EXPORT_FORMATS = ["onnx", "openvino"]
 EXPORT_MANIFEST_FILE = "export.json"
 LEGACY_BACKEND_FILES = {
@@ -101,9 +100,9 @@ def resolve_backend(backend: str, export_config: ExportConfigMixin | dict[str, A
 
 
 def _resolve_export_config(export_format: str, export_config: ExportConfigMixin | dict[str, Any] | None):
-    from transformers.exporters import export_backend
+    from transformers.exporters import get_export_config_class
 
-    config_class = export_backend(export_format, "config")
+    config_class = get_export_config_class(export_format)
     if export_config is None:
         # Dynamic shapes, as texts of any batch size and length must be supported
         return config_class(dynamic=True)
@@ -147,31 +146,30 @@ def export(
 class ExportedModule:
     """Runs an exported graph on the features of a model, in place of its modules, and saves the export."""
 
-    def __init__(
-        self,
-        model: ExportedModel,
-        artifacts: ExportArtifacts | None = None,
-        source: tuple[str, dict[str, Any]] | None = None,
-    ):
-        self.model = model
-        # Set when the model was exported just now, saving writes these
+    def __init__(self, artifacts: ExportArtifacts, device: str | None = None):
         self.artifacts = artifacts
-        # Set when the model was loaded: the ``(model_name_or_path, download_kwargs)`` to copy the files from
-        self.source = source
+        self.model = artifacts.runtime(device=device)
+        # TODO: get device from self.model and remove
+        self._device = torch.device(device) if device is not None else None
 
     @property
     def device(self) -> torch.device:
-        return self.model.device
+        return self._device
+
+    @property
+    def input_names(self) -> tuple[str, ...]:
+        """The names of the forward kwargs the graph was traced with."""
+        return tuple(self.model.runner.metadata.kwargs)
 
     def __call__(self, features: dict[str, Any], **kwargs) -> dict[str, Any]:
         if kwargs:
             logger.warning_once(
                 f"The forward keyword arguments {kwargs} are ignored, as exported graph was traced without them. "
             )
-        missing = [name for name in self.model.input_names if name not in features]
+        missing = [name for name in self.input_names if name not in features]
         if missing:
             raise ValueError(
-                f"The exported model takes the features {list(self.model.input_names)}, but {missing} are missing from "
+                f"The exported model takes the features {list(self.input_names)}, but {missing} are missing from "
                 f"the preprocessed inputs {sorted(features)}."
             )
 
@@ -180,31 +178,7 @@ class ExportedModule:
 
     def save(self, output_path: str | os.PathLike) -> None:
         """Save the exported graph and its manifest to ``output_path``."""
-        if self.artifacts is not None:
-            self.artifacts.save_pretrained(output_path)
-            return
-
-        from transformers.exporters.base import read_export_manifest, resolve_export_file
-
-        model_name_or_path, download_kwargs = self.source
-        manifest = read_export_manifest(model_name_or_path, **download_kwargs)
-        files = [EXPORT_MANIFEST_FILE] + [entry["file"] for entry in manifest["components"].values()]
-        # Large ONNX models keep their weights in files next to the graph, and OpenVINO has a .bin next to the .xml
-        os.makedirs(output_path, exist_ok=True)
-        for file_name in files:
-            path = resolve_export_file(model_name_or_path, file_name, **download_kwargs)
-            if path is None:
-                continue
-            siblings = [
-                sibling
-                for sibling in Path(path).parent.glob(f"{Path(file_name).stem}*")
-                if sibling.name != Path(file_name).name and sibling.suffix in (".bin", ".data")
-            ]
-            for source in [Path(path), *siblings]:
-                target = Path(output_path) / source.name
-                # Saving in the directory the model was loaded from keeps its files as they are
-                if not (target.exists() and target.samefile(source)):
-                    shutil.copyfile(source, target)
+        self.artifacts.save_pretrained(output_path)
 
 
 def has_export_config(model_name_or_path: str | Path, export_format: str, **kwargs) -> bool:
@@ -249,12 +223,7 @@ def load_exported_model(
         return None
     exporters = require_transformers_exporters()
 
-    # Only the graph is resolved when loading, so fetch the weights stored next to it (OpenVINO ``.bin``, ONNX ``_data``)
-    manifest = exporters.base.read_export_manifest(model_name_or_path, **kwargs)
-    for component in manifest["components"].values():
-        graph = Path(component["file"])
-        for weights in (graph.with_suffix(".bin"), graph.with_name(f"{graph.name}_data")):
-            exporters.base.resolve_export_file(model_name_or_path, weights.as_posix(), **kwargs)
-
-    model = exporters.AutoExportedModel.from_pretrained(model_name_or_path, device=device, **kwargs)
-    return ExportedModule(model, source=(model_name_or_path, kwargs))
+    # ``ExportArtifacts.from_pretrained`` do not take ``local_files_only``, remove once the case
+    kwargs = {key: value for key, value in kwargs.items() if key != "local_files_only"}
+    artifacts = exporters.ExportArtifacts.from_pretrained(model_name_or_path, **kwargs)
+    return ExportedModule(artifacts, device=device)
